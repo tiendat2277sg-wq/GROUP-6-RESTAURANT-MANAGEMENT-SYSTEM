@@ -1,6 +1,6 @@
-# Phurai · Bộ thiết lập môi trường
+Bộ thiết lập môi trường
 
-Repo lưu cấu hình Vercel, phiên bản thư viện và công cụ chạy dự án trên Windows. Để chạy ứng dụng, chép các file setup vào thư mục mã nguồn Phurai riêng có backend, frontend và database. Giữ file .env riêng của máy.
+Repo lưu cấu hình Vercel, phiên bản thư viện và công cụ chạy dự án trên Windows. Để chạy ứng dụng, chép các file setup vào thư mục mã nguồn riêng có backend, frontend và database. Giữ file .env riêng của máy.
 
 Dùng Node.js 24 và chạy npm ci trong thư mục dự án đầy đủ. Với bộ local Windows đã đóng gói, OPEN-LOCAL.cmd mở ứng dụng và CHECK-ENVIRONMENT.cmd kiểm tra môi trường. Các file CMD và scripts/setup-windows.ps1 sử dụng runtime Node đi kèm gói local.
 
