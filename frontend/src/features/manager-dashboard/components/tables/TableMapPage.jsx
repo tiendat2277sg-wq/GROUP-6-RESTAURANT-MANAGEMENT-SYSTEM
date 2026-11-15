@@ -1,0 +1,615 @@
+import { useLanguage } from '@/core/i18n/LanguageProvider.jsx';
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useSearchParams } from "react-router-dom";
+import { ManagerModal } from "../ManagerOverlay.jsx";
+import { SectionHead, ContentPanel, StatusBadge, Button } from "../ManagerUI.jsx";
+import { useManagerPortal } from "../../context/ManagerPortalContext.jsx";
+import { TABLE_STATUS_META, AREAS } from "@/shared/constants.js";
+import { fetchAreas, fetchFilteredTables, mergeTablesApi, unmergeTableApi, updateTableApi, deleteTableApi, fetchTableTimelineApi, fetchTableQueueApi } from "../../services/managerApi.js";
+import { TableUpcomingQueueSection } from "@/features/staff-dashboard/components/StaffTableTab.jsx";
+
+import { asArray } from "@/core/utils/asArray.js";
+import AddTableModal from "./AddTableModal.jsx";
+import TableMapFilterBar from "./TableMapFilterBar.jsx";
+import { STATUS_KEYS, STATUS_SLUG_TO_API } from "./tableConstants.js";
+import { QRCodeSVG as QRCode } from "qrcode.react";
+import TableQrOrderLink from "@/components/common/TableQrOrderLink.jsx";
+import TableReleaseIndicator from "@/components/common/TableReleaseIndicator.jsx";
+import TableStageIndicator from "@/components/common/TableStageIndicator.jsx";
+
+
+const SEARCH_DEBOUNCE_MS = 300;
+
+function parseStatusesParam(raw) {
+  if (!raw) return [];
+  return raw
+    .split(",")
+    .map((item) => item.trim().toLowerCase())
+    .filter((slug) => STATUS_KEYS.includes(slug));
+}
+
+function readFiltersFromUrl(searchParams) {
+  return {
+    search: searchParams.get("search") || "",
+    areaId: searchParams.get("area_id") || "",
+    selectedStatuses: parseStatusesParam(searchParams.get("statuses")),
+  };
+}
+
+function buildFilterSearchParams(searchParams, { search, areaId, selectedStatuses }) {
+  const next = new URLSearchParams(searchParams);
+  const trimmed = search.trim();
+
+  if (trimmed) next.set("search", trimmed);
+  else next.delete("search");
+
+  if (areaId) next.set("area_id", String(areaId));
+  else next.delete("area_id");
+
+  if (selectedStatuses.length > 0) next.set("statuses", selectedStatuses.join(","));
+  else next.delete("statuses");
+
+  return next;
+}
+
+function TableMapPage({ tables, setTables, pendingAction, role, toast }) {
+  const { translateLabel } = useLanguage();
+  const tableList = asArray(tables);
+  const { currentUser } = useManagerPortal();
+  const managerUserId = currentUser?.userId ?? currentUser?.id ?? null;
+  const [searchParams, setSearchParams] = useSearchParams();
+
+  const initialFilters = useMemo(() => readFiltersFromUrl(searchParams), []);
+
+  const [searchInput, setSearchInput] = useState(initialFilters.search);
+  const [debouncedSearch, setDebouncedSearch] = useState(initialFilters.search);
+  const [areaId, setAreaId] = useState(initialFilters.areaId);
+  const [selectedStatuses, setSelectedStatuses] = useState(initialFilters.selectedStatuses);
+
+  const [areas, setAreas] = useState([]);
+  const [areasLoading, setAreasLoading] = useState(false);
+  const [listLoading, setListLoading] = useState(false);
+
+  const [addModalOpen, setAddModalOpen] = useState(false);
+  const [editing, setEditing] = useState(null);
+  const [timeline, setTimeline] = useState([]);
+  const [confirmDel, setConfirmDel] = useState(null);
+  const [clockNow, setClockNow] = useState(() => new Date());
+
+  const [isJiggling, setIsJiggling] = useState(false);
+  const pressTimer = useRef(null);
+
+  const isManager = role === "manager";
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => {
+      setDebouncedSearch(searchInput);
+    }, SEARCH_DEBOUNCE_MS);
+    return () => window.clearTimeout(timer);
+  }, [searchInput]);
+
+  useEffect(() => {
+    const timer = window.setInterval(() => setClockNow(new Date()), 30000);
+    return () => window.clearInterval(timer);
+  }, []);
+
+  useEffect(() => {
+    setSearchParams(
+      (current) => {
+        const next = buildFilterSearchParams(current, {
+          search: debouncedSearch,
+          areaId,
+          selectedStatuses,
+        });
+        return next.toString() === current.toString() ? current : next;
+      },
+      { replace: true }
+    );
+  }, [debouncedSearch, areaId, selectedStatuses, setSearchParams]);
+
+  const setTablesRef = useRef(setTables);
+  useEffect(() => {
+    setTablesRef.current = setTables;
+  }, [setTables]);
+
+  const loadFilteredTables = useCallback(async () => {
+    if (!managerUserId) return;
+    setListLoading(true);
+    try {
+      const statuses =
+        selectedStatuses.length > 0
+          ? selectedStatuses.map((slug) => STATUS_SLUG_TO_API[slug]).join(",")
+          : undefined;
+
+      const res = await fetchFilteredTables(
+        {
+          search: debouncedSearch.trim() || undefined,
+          area_id: areaId || undefined,
+          statuses,
+        },
+        managerUserId
+      );
+      setTablesRef.current(Array.isArray(res.data) ? res.data : []);
+    } catch {
+      setTablesRef.current([]);
+    } finally {
+      setListLoading(false);
+    }
+  }, [managerUserId, debouncedSearch, areaId, selectedStatuses]);
+
+  useEffect(() => {
+    if (!managerUserId) return undefined;
+
+    let alive = true;
+    setAreasLoading(true);
+
+    fetchAreas(managerUserId)
+      .then((res) => {
+        if (!alive) return;
+        setAreas(Array.isArray(res.data) ? res.data : []);
+      })
+      .catch(() => {
+        if (!alive) return;
+        setAreas([]);
+      })
+      .finally(() => {
+        if (alive) setAreasLoading(false);
+      });
+
+    return () => {
+      alive = false;
+    };
+  }, [managerUserId]);
+
+  useEffect(() => {
+    loadFilteredTables();
+  }, [loadFilteredTables]);
+
+  useEffect(() => {
+    if (pendingAction === "add" && isManager) {
+      setAddModalOpen(true);
+    }
+  }, [pendingAction, isManager]);
+
+  useEffect(() => {
+    if (editing?.table_id && managerUserId) {
+      setTimeline([]);
+      fetchTableTimelineApi(editing.table_id, managerUserId)
+        .then((res) => {
+          if (res?.success) setTimeline(res.timeline || []);
+        })
+        .catch(() => setTimeline([]));
+    } else {
+      setTimeline([]);
+    }
+  }, [editing?.table_id, managerUserId]);
+
+  const grouped = useMemo(() => {
+    // 1. Natural Sorting
+    const sorted = [...tableList].sort((a, b) => {
+      const cmp = a.area_name.localeCompare(b.area_name);
+      if (cmp !== 0) return cmp;
+      return a.table_number.localeCompare(b.table_number, undefined, { numeric: true });
+    });
+
+    // 2. Resolve Merges Visually
+    const parentMap = new Map();
+    sorted.forEach((t) => {
+      if (!t.merged_into_table_id) {
+        parentMap.set(t.table_id, { ...t, combined_names: [t.table_number], combined_capacity: t.capacity, child_ids: [] });
+      }
+    });
+
+    sorted.forEach((t) => {
+      if (t.merged_into_table_id && parentMap.has(t.merged_into_table_id)) {
+        const parent = parentMap.get(t.merged_into_table_id);
+        parent.combined_names.push(t.table_number);
+        parent.combined_capacity += t.capacity;
+        parent.child_ids.push(t.table_id);
+      }
+    });
+
+    const displayList = Array.from(parentMap.values());
+
+    const map = {};
+    displayList.forEach((t) => {
+      (map[t.area_name] = map[t.area_name] || []).push(t);
+    });
+    return map;
+  }, [tableList]);
+
+  const areaCount = areas.length || AREAS.length;
+  const groupedEntries = Object.entries(grouped);
+
+  // Drag and Drop & Long Press
+  const handlePointerDown = (e, t) => {
+    if (!isManager || t.is_counter) return;
+    pressTimer.current = window.setTimeout(() => {
+      setIsJiggling(true);
+    }, 500);
+  };
+
+  const handlePointerUpOrLeave = () => {
+    if (pressTimer.current) window.clearTimeout(pressTimer.current);
+  };
+
+  const handleDragStart = (e, t) => {
+    if (!isJiggling || t.is_counter) {
+      e.preventDefault();
+      return;
+    }
+    e.dataTransfer.setData("application/json", JSON.stringify({ id: t.table_id, area_id: t.area_id }));
+  };
+
+  const handleDrop = async (e, targetTable) => {
+    e.preventDefault();
+    setIsJiggling(false);
+    if (targetTable.is_counter) return;
+
+    try {
+      const data = JSON.parse(e.dataTransfer.getData("application/json"));
+      if (data.id === targetTable.table_id || data.area_id !== targetTable.area_id) return;
+
+      await mergeTablesApi(data.id, targetTable.table_id, managerUserId);
+      toast("Tables merged successfully", "success");
+      loadFilteredTables();
+    } catch (err) {
+      toast(err.message || "Merge failed", "error");
+    }
+  };
+
+  const handleUnmerge = async (tableId) => {
+    try {
+      await unmergeTableApi(tableId, managerUserId);
+      toast("Tables separated", "success");
+      setEditing(null);
+      loadFilteredTables();
+    } catch (err) {
+      toast(err.message || "Failed to separate tables", "error");
+    }
+  };
+
+  const toggleStatusFilter = (slug) => {
+    if (slug === "clear") {
+      setSelectedStatuses([]);
+    } else {
+      setSelectedStatuses([slug]);
+    }
+  };
+
+  const handleAddSuccess = () => {
+    toast("Table added successfully", "success");
+    loadFilteredTables();
+  };
+
+  const saveEdit = async () => {
+    if (!editing.table_number.trim()) {
+      toast("Table number is required", "error");
+      return;
+    }
+
+    try {
+      const apiStatus = STATUS_SLUG_TO_API[String(editing.status).toLowerCase()] || "Available";
+      const payload = {
+        table_number: editing.table_number.trim(),
+        area_id: editing.area_id || (areas.find(a => a.area_name === editing.area_name)?.area_id) || 1,
+        capacity: Number(editing.capacity) || 1,
+        status: apiStatus
+      };
+
+      await updateTableApi(editing.table_id, payload, managerUserId);
+
+      toast("Table updated", "success");
+      setEditing(null);
+      loadFilteredTables();
+    } catch (err) {
+      toast(err.message || "Failed to update table", "error");
+    }
+  };
+
+  const quickStatus = async (t, status) => {
+    try {
+      const apiStatus = STATUS_SLUG_TO_API[String(status).toLowerCase()] || "Available";
+      const payload = {
+        table_number: t.table_number,
+        area_id: t.area_id || (areas.find(a => a.area_name === t.area_name)?.area_id) || 1,
+        capacity: Number(t.capacity) || 1,
+        status: apiStatus
+      };
+
+      await updateTableApi(t.table_id, payload, managerUserId);
+      toast(`${t.table_number} → ${TABLE_STATUS_META[status].label}`, "success");
+      loadFilteredTables();
+    } catch (err) {
+      toast(err.message || "Failed to update status", "error");
+    }
+  };
+
+  const remove = async () => {
+    try {
+      await deleteTableApi(confirmDel.table_id, managerUserId);
+      toast("Table removed", "success");
+      setConfirmDel(null);
+      loadFilteredTables();
+    } catch (err) {
+      toast(err.message || "Failed to remove table", "error");
+    }
+  };
+
+  return (
+    <div className="sfx-stack">
+      <TableMapFilterBar
+        search={searchInput}
+        onSearchChange={setSearchInput}
+        areaId={areaId}
+        onAreaChange={setAreaId}
+        areas={areas}
+        areasLoading={areasLoading}
+        selectedStatuses={selectedStatuses}
+        onToggleStatus={toggleStatusFilter}
+        actions={
+          isManager ? (
+            <Button variant="gold" icon="plus" onClick={() => setAddModalOpen(true)} className="sfx-tablemap__add-btn">
+              {translateLabel("Add Table")}
+            </Button>
+          ) : null
+        }
+      />
+
+      <ContentPanel compact>
+        <div className={`sfx-tablemap-wrap ${listLoading ? "is-loading" : ""}`}>
+          {!listLoading && groupedEntries.length === 0 ? (
+            <div className="sfx-card">
+              <div className="sfx-card__body">
+                <p className="sfx-muted">{translateLabel("No tables match the current filters.")}</p>
+              </div>
+            </div>
+          ) : null}
+
+          {groupedEntries.map(([areaName, list]) => (
+            <div key={areaName} className="sfx-card">
+              <header className="sfx-card__head">
+                <h3 className="sfx-card__title">{areaName}</h3>
+                <span className="sfx-muted">{list.length} {translateLabel("tables")}</span>
+              </header>
+              <div className="sfx-card__body">
+                <div className="sfx-tablemap">
+                  {list.map((t) => {
+                    const displayNum = t.combined_names.join(" | ");
+                    const canMerge = isJiggling && !t.is_counter;
+                    const statusKey = String(t.table_status || t.status || "available").toLowerCase();
+                    return (
+                      <button
+                        key={t.table_id}
+                        type="button"
+                        draggable={canMerge}
+                        onPointerDown={(e) => handlePointerDown(e, t)}
+                        onPointerUp={handlePointerUpOrLeave}
+                        onPointerLeave={handlePointerUpOrLeave}
+                        onDragStart={(e) => handleDragStart(e, t)}
+                        onDragOver={(e) => {
+                          if (canMerge) e.preventDefault();
+                        }}
+                        onDrop={(e) => handleDrop(e, t)}
+                        className={`sfx-mtile sfx-mtile--${(t.upcoming_count > 0 && TABLE_STATUS_META[statusKey]?.tone === "green") ? "amber" : TABLE_STATUS_META[statusKey]?.tone} ${canMerge ? "is-jiggling" : ""}`}
+                        onClick={() => !isJiggling && setEditing({ ...t })}
+                      >
+                        {t.upcoming_count > 0 && (
+                          <div className="sfx-mtile__notif-badge" title={`${t.upcoming_count} upcoming reservation(s) queued`}>
+                            <span>🔔</span>
+                            <span>{t.upcoming_count}</span>
+                          </div>
+                        )}
+                        <span className="sfx-mtile__no">{displayNum}</span>
+                        <span className="sfx-mtile__cap">{t.combined_capacity} {translateLabel("seats")}</span>
+                        <StatusBadge tone={TABLE_STATUS_META[statusKey]?.tone}>
+                          {translateLabel(TABLE_STATUS_META[statusKey]?.label)}
+                        </StatusBadge>
+                        {t.active_reservation_customer_name && (
+                          <div className="sfx-mtile__next-preview" title={`Next: ${t.active_reservation_customer_name}`}>
+                            {translateLabel("Next:")} {t.active_reservation_customer_name}
+                          </div>
+                        )}
+                        <TableReleaseIndicator table={t} now={clockNow} />
+                        <TableStageIndicator table={t} compact />
+
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+            </div>
+          ))}
+        </div>
+      </ContentPanel>
+
+      <AddTableModal
+        open={addModalOpen}
+        onClose={() => setAddModalOpen(false)}
+        onSuccess={handleAddSuccess}
+        managerUserId={managerUserId}
+      />
+
+      <ManagerModal
+        open={Boolean(editing)}
+        title={`Edit ${editing?.combined_names?.join(" | ") || editing?.table_number || "Table"}`}
+        onClose={() => setEditing(null)}
+        footer={
+          <>
+            {isManager ? (
+              <Button
+                variant="danger"
+                icon="trash"
+                onClick={() => {
+                  setConfirmDel(editing);
+                  setEditing(null);
+                }}
+              >
+                {translateLabel("Delete")}
+              </Button>
+            ) : (
+              <span />
+            )}
+            <div className="sfx-modal__footacts">
+              {editing?.child_ids?.length > 0 && isManager && (
+                <Button variant="soft" onClick={() => handleUnmerge(editing.table_id)}>
+                  {translateLabel("Separate Table")}
+                </Button>
+              )}
+              <Button variant="ghost" onClick={() => setEditing(null)}>
+                {translateLabel("Cancel")}
+              </Button>
+              <Button variant="gold" onClick={saveEdit}>
+                {translateLabel("Save changes")}
+              </Button>
+            </div>
+          </>
+        }
+      >
+        {editing ? (
+          <div className="sfx-form">
+            <div className="sfx-tablemap__edit-row">
+              <div className="sfx-tablemap__edit-col-main">
+                <label className="sfx-field">
+                  <span>{translateLabel("Table number")}</span>
+                  <input
+                    className="sfx-input"
+                    value={editing.table_number}
+                    onChange={(e) => setEditing({ ...editing, table_number: e.target.value })}
+                    placeholder="e.g. M-09"
+                  />
+                </label>
+                <div className="sfx-form__row">
+                  <label className="sfx-field">
+                    <span>{translateLabel("Area")}</span>
+                    <select
+                      className="sfx-select"
+                      value={editing.area_name}
+                      onChange={(e) => setEditing({ ...editing, area_name: e.target.value })}
+                    >
+                      {(areas.length ? areas.map((a) => a.area_name) : AREAS).map((a) => (
+                        <option key={a}>{a}</option>
+                      ))}
+                    </select>
+                  </label>
+                  <label className="sfx-field">
+                    <span>{translateLabel("Capacity")}</span>
+                    <input
+                      className="sfx-input"
+                      type="number"
+                      min="1"
+                      max="20"
+                      value={editing.capacity}
+                      onChange={(e) => setEditing({ ...editing, capacity: e.target.value })}
+                    />
+                  </label>
+                </div>
+              </div>
+              
+              {(editing.static_qr_code || editing.qr_code) && (
+                <div style={{ flex: "0 0 200px" }}>
+                  <TableQrOrderLink table={editing} allTables={tableList} />
+                </div>
+              )}
+
+            </div>
+
+            <div className="sfx-field">
+              <span>{translateLabel("Status")}</span>
+              <div className="sfx-chips">
+                {STATUS_KEYS.map((k) => {
+                  const s = TABLE_STATUS_META[k];
+                  const isActive = (STATUS_SLUG_TO_API[k] || "Available") === editing.status;
+                  return (
+                    <button
+                      key={k}
+                      type="button"
+                      onClick={() =>
+                        setEditing({ ...editing, status: STATUS_SLUG_TO_API[k] || "Available" })
+                      }
+                      className={`sfx-chip ${isActive ? "is-active" : "sfx-chip--outline"}`}
+                    >
+                      {translateLabel(s.label)}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+
+            {String(editing.table_status || editing.status).toLowerCase() === "occupied" ? (
+              <div className="manager-table-stage-readout">
+                <TableStageIndicator table={editing} />
+              </div>
+            ) : null}
+
+            {/* Timeline Section */}
+            {timeline.length > 0 && (
+              <div className="sfx-detail__block sfx-tablemap__detail-block">
+                <span>{translateLabel("Timeline")}</span>
+                <ul className="sfx-detail__list">
+                  {timeline.map((log) => {
+                    const dateStr = new Date(log.created_at).toLocaleString('vi-VN', {
+                      day: '2-digit', month: '2-digit', year: '2-digit',
+                      hour: '2-digit', minute: '2-digit'
+                    });
+                    const actionName = log.action_name === 'STAFF_MERGE_TABLES' ? 'ASSEMBLE TABLES' :
+                      log.action_name === 'STAFF_UNMERGE_TABLES' ? 'SEPARATE TABLES' :
+                        log.action_name === 'SYSTEM_AUTO_UNMERGE_ON_CLEAR' ? 'AUTO UNMERGE' : log.action_name;
+                    return (
+                      <li key={log.audit_id} className="sfx-tablemap__timeline-item">
+                        <strong>{actionName}</strong>
+                        <small className="sfx-muted">
+                          {translateLabel("Created: By")} {log.full_name || log.username || "System"} [{dateStr}]
+                        </small>
+                      </li>
+                    );
+                  })}
+                </ul>
+              </div>
+            )}
+
+            <div className="sfx-quickstatus">
+              <span className="sfx-muted">{translateLabel("Quick set:")}</span>
+              {["available", "occupied", "cleaning"].map((k) => (
+                <Button key={k} size="sm" variant="soft" onClick={() => quickStatus(editing, k)}>
+                  {translateLabel(TABLE_STATUS_META[k].label)}
+                </Button>
+              ))}
+            </div>
+
+            <TableUpcomingQueueSection
+              tableId={editing.table_id}
+              userId={managerUserId}
+              showPhone={false}
+              customFetcher={fetchTableQueueApi}
+            />
+          </div>
+
+        ) : null}
+      </ManagerModal>
+
+      <ManagerModal
+        open={Boolean(confirmDel)}
+        title={translateLabel("Delete table?")}
+        size="sm"
+        onClose={() => setConfirmDel(null)}
+        footer={
+          <div className="sfx-modal__footacts">
+            <Button variant="ghost" onClick={() => setConfirmDel(null)}>
+              {translateLabel("Keep")}
+            </Button>
+            <Button variant="danger" icon="trash" onClick={remove}>
+              {translateLabel("Delete")}
+            </Button>
+          </div>
+        }
+      >
+        <p className="sfx-confirm-text">
+          {translateLabel("Remove")} <strong>{confirmDel?.table_number}</strong> ({confirmDel?.area_name}{translateLabel(") from the floor plan?")}
+        </p>
+      </ManagerModal>
+    </div>
+  );
+}
+
+export default TableMapPage;

@@ -1,0 +1,121 @@
+import { useLanguage } from '@/core/i18n/LanguageProvider.jsx';
+import KpiCard from "../KpiCard.jsx";
+import { Card, StatusBadge, Button } from "../ManagerUI.jsx";
+import {
+  TABLE_STATUS_META,
+  ORDER_STATUS_META,
+} from "@/shared/constants.js";
+import { RESERVATION_STATUS_META } from "@/shared/reservationStatus.js";
+
+import { asArray } from "@/core/utils/asArray.js";
+import { isSameDay } from "date-fns";
+
+/* Operations-focused view (no revenue) for floor & kitchen manager. */
+function TodaySection({ kpis, reservations, tables, orders, onNavigate }) {
+  const { translateLabel } = useLanguage();
+  const kpiList = asArray(kpis);
+  const reservationList = asArray(reservations);
+
+  const todaysReservations = reservationList.filter((r) => {
+    if (!r.reservation_start_at) return false;
+    return isSameDay(new Date(r.reservation_start_at), new Date());
+  });
+
+  const tableList = asArray(tables);
+  const orderList = asArray(orders);
+
+  const opsKpis = kpiList
+    .filter((k) =>
+      ["reservations", "occupied", "pendingOrders", "kitchen"].includes(k.id)
+    )
+    .map((k) => {
+      if (k.id === "reservations") {
+        return { ...k, value: todaysReservations.length };
+      }
+      return k;
+    });
+
+  const arriving = todaysReservations.filter((r) => {
+    const s = r.reservation_status || r.status;
+    return ["Await Check-in", "Pending Request", "pending", "confirmed"].includes(s);
+  });
+  const kitchenQueue = orderList.filter((o) => o.kitchen_status !== "done");
+
+  return (
+    <div className="sfx-stack">
+      <div className="sfx-kpis">
+        {opsKpis.map((c, i) => (
+          <KpiCard key={c.id} card={c} index={i} />
+        ))}
+      </div>
+
+      <div className="sfx-grid sfx-grid--2">
+        <Card
+          title={translateLabel("Arriving guests")}
+        >
+          <ul className="sfx-timeline">
+            {arriving.length ? (
+              arriving.filter(Boolean).map((r) => (
+                <li key={r.reservation_id} className="sfx-timeline__row">
+                  <span className="sfx-timeline__time">{r.start_time}</span>
+                  <span className="sfx-timeline__main">
+                    <strong>{r.customer_name}</strong>
+                    <small>{r.guest_count} {translateLabel("guests ·")} {r.table_label}</small>
+                  </span>
+                  <StatusBadge tone={RESERVATION_STATUS_META[r.status]?.tone} color={RESERVATION_STATUS_META[r.status]?.color}>
+                    {translateLabel(RESERVATION_STATUS_META[r.status]?.label)}
+                  </StatusBadge>
+                </li>
+              ))
+            ) : (
+              <li className="sfx-muted">{translateLabel("No arriving guests right now.")}</li>
+            )}
+          </ul>
+        </Card>
+
+        <Card
+          title={translateLabel("Kitchen queue")}
+          action={<Button size="sm" variant="ghost" onClick={() => onNavigate("orders", "tab-kitchen")}>{translateLabel("Open")}</Button>}
+        >
+          <ul className="sfx-timeline">
+            {kitchenQueue.length ? (
+              kitchenQueue.filter(Boolean).map((o) => (
+                <li key={o.order_id} className="sfx-timeline__row">
+                  <span className="sfx-timeline__time">{o.order_number}</span>
+                  <span className="sfx-timeline__main">
+                    <strong>{translateLabel("Table")} {o.table_label}</strong>
+                    <small>{o.items_count} {translateLabel("items")}</small>
+                  </span>
+                  <StatusBadge tone={ORDER_STATUS_META[o.kitchen_status]?.tone}>
+                    {translateLabel(ORDER_STATUS_META[o.kitchen_status]?.label)}
+                  </StatusBadge>
+                </li>
+              ))
+            ) : (
+              <li className="sfx-muted">{translateLabel("No orders in the kitchen queue.")}</li>
+            )}
+          </ul>
+        </Card>
+      </div>
+
+      <Card
+        title={translateLabel("Table status")}
+        action={<Button size="sm" variant="ghost" onClick={() => onNavigate("tables")}>{translateLabel("Manage")}</Button>}
+      >
+        <div className="sfx-tiles">
+          {tableList.filter(Boolean).map((t) => {
+            const statusKey = String(t.table_status || t.status || "available").toLowerCase();
+            return (
+              <div key={t.table_id} className={`sfx-tile sfx-tile--${TABLE_STATUS_META[statusKey]?.tone}`}>
+                <strong>{t.table_number}</strong>
+                <small>{translateLabel(TABLE_STATUS_META[statusKey]?.label)}</small>
+              </div>
+            );
+          })}
+        </div>
+      </Card>
+    </div>
+  );
+}
+
+export default TodaySection;

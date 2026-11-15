@@ -1,0 +1,150 @@
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+@font-face {
+  font-family: 'Imperial Script';
+  src: url('/fonts/aef17d5c8725ce5e.ttf') format('truetype');
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: 'Playfair Display';
+  src: url('/fonts/playfair-display.ttf') format('truetype');
+  font-weight: 400 900;
+  font-display: swap;
+}
+
+:root {
+  --color-primary: #8c764b;
+  --color-secondary: #846d44;
+  --color-background: #f3f4f6;
+  --color-text: #342716;
+  --font-family: "Hanken Grotesk", "Segoe UI", Arial, sans-serif;
+  --font-script: 'Imperial Script', cursive;
+  --font-serif: "Playfair Display", Georgia, serif;
+  --font-heading: var(--font-serif);
+  --font-display: var(--font-heading);
+  --font-body: var(--font-family);
+  --font-nav: var(--font-family);
+  --font-ui: var(--font-family);
+  --font-ui-bold: var(--font-family);
+  --font-narrow: var(--font-family);
+}
+
+/* Shared by page styles, inline component styles, and dialogs mounted under body. */
+@layer fuku-typography {
+  h1, h2, h3, .menu-card__name, .menu-set-card__title-line, .apple-liquid-glass-card h3,
+  .set-menu-sheet-en strong, .set-menu-sheet-en__row > :last-child, .omakase-gallery__body h3 {
+    font-family: var(--font-heading) !important;
+  }
+
+  .phurai-navbar__logo, .phurai-footer__logo, .phurai-footer__watermark,
+  .fuku-intro-wordmark, .auth-card__brand, .auth-welcome__logo {
+    font-family: var(--font-script) !important;
+    font-weight: 400;
+    letter-spacing: normal;
+    text-transform: capitalize;
+  }
+
+  html, body, button, input, select, textarea {
+    font-family: var(--font-body) !important;
+  }
+
+  :where(body *) {
+    font-family: inherit !important;
+  }
+
+  code, pre, kbd, samp {
+    font-family: ui-monospace, monospace !important;
+  }
+}
+
+html {
+  scroll-behavior: smooth;
+}
+
+body {
+  font-family: var(--font-family);
+  background-color: var(--color-background);
+  color: var(--color-text);
+  line-height: 1.5;
+  min-height: 100vh;
+}
+
+
+button,
+input,
+select,
+textarea {
+  font: inherit;
+}
+
+a:focus-visible,
+button:focus-visible {
+  outline: 2px solid var(--color-primary);
+  outline-offset: 2px;
+}
+
+@keyframes shimmer {
+  0% {
+    background-position: -200% 0;
+  }
+  100% {
+    background-position: 200% 0;
+  }
+}
+
+.shimmer {
+  background: linear-gradient(90deg, #f3f4f6 25%, #e5e7eb 50%, #f3f4f6 75%);
+  background-size: 200% 100%;
+  animation: shimmer 1.5s infinite linear;
+}
+
+.dark .shimmer {
+  background: linear-gradient(90deg, #1f2937 25%, #374151 50%, #1f2937 75%);
+  background-size: 200% 100%;
+}
+
+/* Disable focus outlines and highlight overlays on recharts elements */
+.recharts-wrapper, 
+.recharts-wrapper *, 
+.recharts-surface, 
+.recharts-surface * {
+  outline: none !important;
+  box-shadow: none !important;
+  user-select: none !important;
+  -webkit-user-select: none !important;
+  -moz-user-select: none !important;
+  -ms-user-select: none !important;
+  -webkit-tap-highlight-color: transparent !important;
+}
+
+.fuku-language {
+  position: relative;
+  display: inline-grid;
+  place-items: center;
+  flex: 0 0 auto;
+  min-width: 42px;
+  height: 36px;
+  padding: 0 6px;
+  border-radius: 18px;
+  background: #fff;
+  color: #302a23;
+  border: 1px solid #c9c3ba;
+  font-size: 13px;
+  font-weight: 600;
+}
+.fuku-language select { position: absolute; inset: 0; width: 100%; opacity: 0; cursor: pointer; }
+.fuku-language:focus-within { outline: 2px solid #876b47; outline-offset: 2px; }
+.fuku-language--floating { position: fixed; bottom: 14px; right: 14px; left: auto; z-index: 900; }

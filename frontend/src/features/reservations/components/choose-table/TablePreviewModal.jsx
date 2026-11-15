@@ -1,0 +1,174 @@
+import { useLanguage } from '@/core/i18n/LanguageProvider.jsx';
+import React, { useState, useEffect, useCallback } from 'react';
+import { createPortal } from 'react-dom';
+import { Users, AlertTriangle, Maximize2, X } from 'lucide-react';
+import { getTableInfo } from '../../data/tableImages';
+import {areaLabel} from './tablePresentation';
+import '../../styles/table-preview-modal.css';
+
+function getTableStatus(apiTable) {
+  if (!apiTable) return 'Available';
+  if (apiTable.is_current || (apiTable.availability_at_slot || "").toLowerCase() === "currenttable") return "CurrentTable";
+  if (apiTable.is_bookable === false) {
+    const avail = (apiTable.availability_at_slot || "").toLowerCase();
+    if (avail === "occupied") return "Occupied";
+    if (avail === "cleaning") return "Cleaning";
+    if (avail === "inactive") return "Inactive";
+    return "Reserved";
+  }
+  return "Available";
+}
+
+export default function TablePreviewModal({
+  table,
+  apiTable,
+  tableStatus,
+  isSelected = false,
+  isOpen,
+  onClose,
+  onSelect
+}) {
+  const { translateLabel,language } = useLanguage();
+  const [isLightboxOpen, setIsLightboxOpen] = useState(false);
+
+  const tableCode = table || apiTable?.table_number || 'TABLE';
+  const tableInfo = getTableInfo(tableCode, apiTable);
+  const status = tableStatus || getTableStatus(apiTable);
+  const isAvailable = status === 'Available' || status === 'CurrentTable';
+  const unavailableText = (() => {
+    if (status === 'InvalidCapacity') {
+      if(language==='vi')return `Bàn có ${tableInfo.capacity} chỗ, không phù hợp với số khách đã chọn. Vui lòng chọn bàn khác.`;
+      return `This table has ${tableInfo.capacity} seats and is not suitable for the selected guest count. Please choose a better-matched table.`;
+    }
+    return language==='vi' ? 'Bàn hiện không thể đặt. Vui lòng chọn bàn khác.' : `This table is currently unavailable (${status}). Please select another table.`;
+  })();
+
+  const handleKeyDown = useCallback((e) => {
+    if (e.key === 'Escape') {
+      if (isLightboxOpen) {
+        setIsLightboxOpen(false);
+      } else {
+        onClose();
+      }
+    }
+  }, [onClose, isLightboxOpen]);
+
+  useEffect(() => {
+    if (!isOpen) return;
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [isOpen, handleKeyDown]);
+
+  if (!isOpen || !table) return null;
+
+  const handleSelectClick = () => {
+    if (!isAvailable) return;
+    const tableIdentifier = apiTable?.table_id || tableCode;
+    onSelect(tableIdentifier);
+    onClose();
+  };
+
+  return createPortal(
+    <>
+      <div className="tpm-overlay" onClick={onClose} role="dialog" aria-modal="true">
+        <div className="tpm-card" onClick={(e) => e.stopPropagation()}>
+          {/* Preview Image Header with Click-to-Expand */}
+          <div
+            className="tpm-image-wrap"
+            onClick={() => setIsLightboxOpen(true)}
+          >
+            <img src={tableInfo.image} alt={tableCode} className="tpm-image" />
+            <div className="tpm-image-badge">{tableInfo.zone}</div>
+            
+            <div className="tpm-expand-hint">
+              <Maximize2 size={13} />
+              <span>{translateLabel("Click for full screen")}</span>
+            </div>
+
+            <button
+              type="button"
+              className="tpm-close-btn"
+              onClick={(e) => { e.stopPropagation(); onClose(); }}
+              aria-label={translateLabel("Close modal")}
+            >
+              <X size={18} />
+            </button>
+          </div>
+
+          {/* Info Content Section */}
+          <div className="tpm-body">
+            <div className="tpm-header">
+              <div className="tpm-title-group">
+                <h3 className="tpm-table-code">{translateLabel("Table")} {tableCode}</h3>
+                <p className="tpm-zone-name">{areaLabel(apiTable?.area_name || tableInfo.zone,language)}</p>
+              </div>
+              <div className="tpm-capacity-badge">
+                <Users size={15} />
+                <span>{tableInfo.capacity} {translateLabel("Guests")}</span>
+              </div>
+            </div>
+
+            <p className="tpm-description">{translateLabel(tableInfo.description)}</p>
+
+            <div className="tpm-features">
+              <span className="tpm-feature-chip">{translateLabel("Prime View")}</span>
+              <span className="tpm-feature-chip">{translateLabel("Fine Dining Setup")}</span>
+              <span className="tpm-feature-chip">{translateLabel("Table Service")}</span>
+            </div>
+
+            {/* Red Alert Banner if Table is Occupied / Reserved / Cleaning */}
+            {!isAvailable && (
+              <div className="tpm-alert-banner">
+                <AlertTriangle size={18} className="tpm-alert-icon" />
+                <span>{unavailableText}</span>
+              </div>
+            )}
+          </div>
+
+          {/* Fixed Action Bar — Strictly Cancel & Select */}
+          <div className="tpm-actions">
+            <button
+              type="button"
+              className="tpm-btn-cancel"
+              onClick={onClose}
+            >
+              {translateLabel("Cancel")}
+            </button>
+            <button
+              type="button"
+              className={`tpm-btn-select${!isAvailable ? ' tpm-btn-select--disabled' : ''}`}
+              onClick={handleSelectClick}
+              disabled={!isAvailable}
+            >
+              {translateLabel(isSelected ? 'Deselect table' : 'Select table')}
+            </button>
+          </div>
+        </div>
+      </div>
+
+      {/* Fullscreen Lightbox Modal */}
+      {isLightboxOpen && (
+        <div
+          className="tpm-lightbox-overlay"
+          onClick={() => setIsLightboxOpen(false)}
+        >
+          <div
+            className="tpm-lightbox-content"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <button
+              type="button"
+              className="tpm-lightbox-close"
+              onClick={() => setIsLightboxOpen(false)}
+            >
+              <X size={20} />
+            </button>
+            <img src={tableInfo.image} alt={tableCode} className="tpm-lightbox-img" />
+            <div className="tpm-lightbox-caption">{translateLabel("Table")} {tableCode} — {tableInfo.zone}</div>
+          </div>
+        </div>
+      )}
+    </>,
+    document.body
+  );
+}

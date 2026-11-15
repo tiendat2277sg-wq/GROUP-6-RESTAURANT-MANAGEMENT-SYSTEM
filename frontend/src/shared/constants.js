@@ -1,0 +1,230 @@
+// Trigger HMR
+import { menuCategories } from "../features/menu/data/menuData.js";
+export * from "./reservationStatus.js";
+import { format, subDays, startOfDay, endOfDay, isSameDay, isWithinInterval, addDays, startOfMonth, endOfMonth, subMonths, startOfQuarter, endOfQuarter, subQuarters, startOfYear, endOfYear, subYears } from "date-fns";
+
+export const TABLE_STATUS_META = {
+  available: { label: "Available", tone: "green" },
+  reserved: { label: "Reserved", tone: "blue" },
+  occupied: { label: "Occupied", tone: "amber" },
+  cleaning: { label: "Cleaning", tone: "purple" },
+  inactive: { label: "Inactive", tone: "muted" },
+};
+
+export const AREAS = [
+  "Main Dining",
+  "Window Area",
+  "Wine Bar",
+  "VIP Lounge",
+  "Private Room",
+  "Rooftop Terrace",
+  "Balcony",
+  "Event Corner",
+];
+
+export const DISH_CATEGORIES = menuCategories.map((cat) => cat.name);
+
+export const ORDER_STATUS_META = {
+  queued: { label: "Queued", tone: "muted" },
+  in_progress: { label: "In Progress", tone: "amber" },
+  cooking: { label: "Cooking", tone: "red" },
+  ready: { label: "Ready", tone: "green" },
+  served: { label: "Served", tone: "blue" },
+  done: { label: "Done", tone: "muted" },
+};
+
+export const STAFF_ASSIGNABLE_ROLES = ["Restaurant Staff"]; // Kitchen Staff (role_id=3) deprecated
+
+
+export const MANAGER_STATUS_META = {
+  active: { label: "Active", tone: "green" },
+  inactive: { label: "Inactive", tone: "muted" },
+  on_leave: { label: "On Leave", tone: "amber" },
+};
+
+export const SHIFTS = ["Morning", "Evening", "Night"];
+
+export const PROMO_STATUS_META = {
+  active: { label: "Active", tone: "green" },
+  scheduled: { label: "Scheduled", tone: "blue" },
+  expired: { label: "Expired", tone: "muted" },
+};
+
+export const DASHBOARD_TODAY = new Date();
+
+export const KPI_CARDS = [
+  {
+    id: "revenue",
+    label: "Today Revenue",
+    value: 48750000,
+    format: "currency",
+    icon: "wallet",
+    trend: { dir: "up", text: "+18.2% vs yesterday" },
+    accent: "gold",
+  },
+  {
+    id: "reservations",
+    label: "Reservations Today",
+    value: 45,
+    format: "number",
+    icon: "calendar",
+    trend: { dir: "up", text: "+11 new today" },
+    accent: "blue",
+  },
+  {
+    id: "occupied",
+    label: "Occupied Tables",
+    value: 18,
+    suffix: " / 28",
+    format: "number",
+    icon: "grid",
+    trend: { dir: "up", text: "64% capacity" },
+    accent: "green",
+  },
+  {
+    id: "pendingOrders",
+    label: "Pending Orders",
+    value: 12,
+    format: "number",
+    icon: "receipt",
+    trend: { dir: "up", text: "+4 since 6pm" },
+    accent: "amber",
+  },
+  {
+    id: "kitchen",
+    label: "Kitchen Queue",
+    value: 8,
+    format: "number",
+    icon: "fire",
+    trend: { dir: "up", text: "3 firing now" },
+    accent: "red",
+  },
+  {
+    id: "bestDish",
+    label: "Best-selling Dish",
+    value: "Wagyu Sukiyaki",
+    format: "text",
+    icon: "star",
+    trend: { dir: "up", text: "124 sold today" },
+    accent: "gold",
+  },
+  {
+    id: "promos",
+    label: "Active Promotions",
+    value: 5,
+    format: "number",
+    icon: "tag",
+    trend: { dir: "flat", text: "2 ending soon" },
+    accent: "purple",
+  },
+  {
+    id: "rating",
+    label: "Customer Rating",
+    value: "4.8",
+    suffix: " / 5",
+    format: "text",
+    icon: "heart",
+    trend: { dir: "up", text: "2,547 verified reviews" },
+    accent: "green",
+  },
+];
+export const REVENUE_SERIES = { day: [], week: [], month: [] };
+export const DISHES = [];
+export const BEST_SELLERS = [];
+export const ORDERS = [];
+export const MANAGER = [];
+export const PROMOTIONS = [];
+export const RESERVATION_STATS = {
+  total: 0, completed: 0, cancelled: 0, noShow: 0,
+  upcoming: 0, pending: 0, seated: 0
+};
+export const TABLE_UTILIZATION = [];
+export const DEMO_NOTICE = "Live data mode activated.";
+
+export const RESERVATIONS = [];
+export const KITCHEN_TICKETS = [];
+export const QUEUE_RESERVATIONS = [];
+export const STAFF_KDS_DELAYED = [];
+export const STAFF_KDS_READY = [];
+export const STAFF_MENU_DISHES = [];
+export const STAFF_ORDERS = [];
+export const STAFF_REPORT_AUDIT = [];
+export const STAFF_REPORT_SUMMARY = {};
+export function getMockPaymentBill() { return {}; }
+
+export function getDateRangePresets(today) {
+  return [
+    { id: "allDates", label: "All Dates", range: { startDate: null, endDate: null, key: "selection" } },
+    { id: "today", label: "Today", range: { startDate: startOfDay(today), endDate: endOfDay(today), key: "selection" } },
+    { id: "yesterday", label: "Yesterday", range: { startDate: startOfDay(subDays(today, 1)), endDate: endOfDay(subDays(today, 1)), key: "selection" } },
+    { id: "last7", label: "Last 7 Days", range: { startDate: startOfDay(subDays(today, 6)), endDate: endOfDay(today), key: "selection" } },
+    { id: "last30", label: "Last 30 Days", range: { startDate: startOfDay(subDays(today, 29)), endDate: endOfDay(today), key: "selection" } },
+    { id: "thisMonth", label: "This Month", range: { startDate: startOfMonth(today), endDate: endOfMonth(today), key: "selection" } },
+    { id: "lastMonth", label: "Last Month", range: { startDate: startOfMonth(subMonths(today, 1)), endDate: endOfMonth(subMonths(today, 1)), key: "selection" } },
+    { id: "thisQuarter", label: "This Quarter", range: { startDate: startOfQuarter(today), endDate: endOfQuarter(today), key: "selection" } },
+    { id: "lastQuarter", label: "Last Quarter", range: { startDate: startOfQuarter(subQuarters(today, 1)), endDate: endOfQuarter(subQuarters(today, 1)), key: "selection" } },
+    { id: "thisYear", label: "This Year", range: { startDate: startOfYear(today), endDate: endOfYear(today), key: "selection" } },
+    { id: "lastYear", label: "Last Year", range: { startDate: startOfYear(subYears(today, 1)), endDate: endOfYear(subYears(today, 1)), key: "selection" } },
+  ];
+}
+
+export function getDefaultDateRange(today) {
+  return {
+    startDate: startOfDay(subDays(today, 29)),
+    endDate: endOfDay(today),
+    key: "selection"
+  };
+}
+
+export function formatDateRangeLabel(range) {
+  if (!range || !range.startDate || !range.endDate) return "All Dates";
+  if (isSameDay(range.startDate, range.endDate)) return format(range.startDate, "dd/MM/yyyy");
+  return `${format(range.startDate, "dd/MM/yyyy")} – ${format(range.endDate, "dd/MM/yyyy")}`;
+}
+
+export function generateTwoYearDailyRevenue(today) {
+  const series = [];
+  let current = subDays(today, 730);
+  while (current <= today) {
+    series.push({
+      date: format(current, "yyyy-MM-dd"),
+      dateObj: current,
+      revenue: Math.floor(Math.random() * 10000000) + 5000000,
+      reservations: Math.floor(Math.random() * 50) + 10,
+    });
+    current = addDays(current, 1);
+  }
+  return series;
+}
+
+export function filterDailyRevenue(series, range) {
+  if (!range || !range.startDate || !range.endDate) return series;
+  return series.filter(item => {
+    return isWithinInterval(item.dateObj, { start: startOfDay(range.startDate), end: endOfDay(range.endDate) });
+  });
+}
+
+export function prepareChartSeries(filteredSeries) {
+  return filteredSeries.map(item => ({
+    name: format(item.dateObj, "MMM dd"),
+    revenue: item.revenue,
+    reservations: item.reservations
+  }));
+}
+
+export function expandReservationsForDemo(reservations, today) {
+  return reservations || [];
+}
+
+export function deriveKpisForRange(baseKpis, dailyRevenueSeries, dateRange, demoReservations) {
+  if (!baseKpis) return [];
+  const filtered = filterDailyRevenue(dailyRevenueSeries, dateRange);
+  const totalRev = filtered.reduce((sum, item) => sum + item.revenue, 0);
+  const totalRes = filtered.reduce((sum, item) => sum + item.reservations, 0);
+
+  return baseKpis.map(kpi => {
+    if (kpi.id === "revenue") return { ...kpi, value: totalRev, label: "Total Revenue", trend:{dir:'flat',text:'Selected period total'} };
+    if (kpi.id === "reservations") return { ...kpi, value: totalRes, label:'Reservations in selected period', trend:{dir:'flat',text:'Selected period total'} };
+    return kpi;
+  });
+}
