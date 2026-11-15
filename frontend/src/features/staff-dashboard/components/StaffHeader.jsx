@@ -1,0 +1,56 @@
+import { useLanguage } from '@/core/i18n/LanguageProvider.jsx';
+/**
+ * StaffHeader — thin wrapper around shared PortalHeader.
+ * Preserves original props API so StaffLayout needs no changes.
+ */
+import PortalHeader from "@/components/portal/PortalHeader.jsx";
+import PortalIcon from "@/components/portal/PortalIcon.jsx";
+
+function StaffHeader({
+  title,
+  subtitle,
+  role,
+  user,
+  search,
+  onSearch,
+  onToggleSidebar,
+  onMobileMenu,
+  onRefresh,
+  refreshing,
+  refreshLabel = "Refresh",
+  onSignOut,
+  onSaveProfile,
+}) {
+  const { translateLabel } = useLanguage();
+  const refreshBtn = (
+    <button
+      type="button"
+      className="sfx-btn sfx-btn--ghost sfx-btn--md"
+      onClick={onRefresh}
+      disabled={refreshing}
+    >
+      <PortalIcon name="refresh" size={16} />
+      <span>{translateLabel(refreshing ? "Refreshing…" : refreshLabel)}</span>
+    </button>
+  );
+
+  return (
+    <PortalHeader
+      title={title}
+      subtitle={subtitle}
+      role={role}
+      user={user}
+      showSearch={Boolean(onSearch)}
+      search={search}
+      onSearch={onSearch}
+      searchPlaceholder="Search guest name or phone…"
+      onToggleSidebar={onToggleSidebar}
+      onMobileMenu={onMobileMenu}
+      extraAction={onRefresh ? refreshBtn : undefined}
+      onSignOut={onSignOut}
+      onSaveProfile={onSaveProfile}
+    />
+  );
+}
+
+export default StaffHeader;

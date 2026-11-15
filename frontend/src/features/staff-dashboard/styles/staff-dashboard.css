@@ -1,0 +1,215 @@
+/* Staff portal — reuses the sfx portal design system for visual parity.
+ * sfx.css is the canonical shared import per ARCHITECTURE.md §8.
+ * Previously imported manager-dashboard.css directly (cross-feature violation). */
+@import '@/components/ui/styles/sfx.css';
+
+/* Staff shell uses the same gray canvas; header stays solid white */
+.sfx-shell--staff {
+  --sfx-bg: #f3f4f6;
+}
+
+.sfx-shell--staff .sfx-header {
+  background: #ffffff;
+  backdrop-filter: none;
+}
+
+.sfx-shell--staff .sfx-brand__text small {
+  color: #9eb8d4;
+}
+
+.sfx-role--restaurant_staff {
+  background: rgba(47, 125, 79, 0.14);
+  color: var(--sfx-green);
+}
+
+.sfx-role--kitchen_staff {
+  background: rgba(183, 121, 31, 0.14);
+  color: var(--sfx-amber);
+}
+
+.sfx-queue-banner {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 16px;
+  margin-bottom: 18px;
+  border-radius: var(--sfx-radius-sm);
+  background: rgba(58, 110, 165, 0.08);
+  border: 1px solid rgba(58, 110, 165, 0.18);
+  font-size: 13px;
+  color: var(--sfx-blue);
+}
+
+.sfx-queue-banner--mock {
+  background: rgba(183, 121, 31, 0.1);
+  border-color: rgba(183, 121, 31, 0.22);
+  color: var(--sfx-amber);
+}
+
+.sfx-assign-form {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.sfx-assign-form label {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 13px;
+  color: var(--sfx-muted);
+}
+
+.sfx-assign-form select {
+  padding: 10px 12px;
+  border-radius: var(--sfx-radius-sm);
+  border: 1px solid var(--sfx-border);
+  background: var(--sfx-card);
+  font-size: 14px;
+  color: var(--sfx-text);
+}
+
+.sfx-tabletile__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  width: 100%;
+  margin-top: 4px;
+}
+
+.sfx-kdsboard {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 16px;
+}
+
+.sfx-kdsticket__items {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 13px;
+}
+
+.sfx-kdsticket__items li span {
+  font-weight: 700;
+  margin-right: 4px;
+}
+
+@media (max-width: 1100px) {
+  .sfx-kdsboard {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* ── Keyframe animations for reservation actions ── */
+@keyframes sfx-fadein {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes sfx-drawer-in {
+  from {
+    opacity: 0;
+    transform: scale(0.97);
+  }
+
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+/* Green flash → fade when a row is actioned (check-in / reject) */
+@keyframes sfx-row-checkedin {
+  0% {
+    background-color: rgba(34, 197, 94, 0.18);
+  }
+
+  60% {
+    background-color: rgba(34, 197, 94, 0.08);
+  }
+
+  100% {
+    background-color: transparent;
+  }
+}
+
+.sfx-table__row--just-actioned {
+  animation: sfx-row-checkedin 1.2s ease-out forwards;
+}
+
+/* Red flash for reject/no-show actions */
+@keyframes sfx-row-rejected {
+  0% {
+    background-color: rgba(239, 68, 68, 0.18);
+  }
+
+  60% {
+    background-color: rgba(239, 68, 68, 0.06);
+  }
+
+  100% {
+    background-color: transparent;
+  }
+}
+
+.sfx-table__row--just-rejected {
+  animation: sfx-row-rejected 1.2s ease-out forwards;
+}.sfx-shell--staff { --sfx-bg:#f5f6f2; --sfx-sidebar-w:232px; background:var(--sfx-bg); }
+.sfx-shell--staff .sfx-sidebar { background:#fcfcf9; border-right:1px solid #dce2d9; }
+.sfx-shell--staff .sfx-brand__text small { color:#52665a; }
+.sfx-shell--staff .sfx-nav__item { min-height:44px; }
+.sfx-shell--staff .sfx-nav__item.is-active { background:#e1ede5; color:#174731; }
+.sfx-shell--staff .sfx-nav__item.is-active .sfx-nav__icon { color:#174731; }
+.sfx-shell--staff .sfx-nav__pill { background:#367153; }
+.sfx-shell--staff :is(button,a):focus-visible { outline:3px solid #b1813c; outline-offset:3px; }
+.crew-workspace { max-width:1120px; margin:0 auto; color:#21392e; }
+.crew-overview { display:grid; grid-template-columns:minmax(0,1.4fr) minmax(265px,1fr); gap:20px; }
+.crew-revenue,.crew-schedule { padding:clamp(21px,2.6vw,34px); border-radius:19px; }
+.crew-revenue { display:flex; flex-direction:column; background:linear-gradient(115deg,#173d32,#285444); color:white; }
+.crew-workspace h2 { margin:0; line-height:1.3; font-family:inherit; font-size:1.15rem; font-weight:650; letter-spacing:0; color:inherit; }
+.crew-heading,.crew-heading h2,.crew-primary,.crew-slot,.crew-shortcuts a { display:flex; align-items:center; gap:10px; }
+.crew-heading { justify-content:space-between; }
+.crew-icon { display:grid; place-items:center; width:44px; height:44px; border:1px solid #ffffff55; color:white; background:transparent; border-radius:50%; cursor:pointer; }
+.crew-icon:hover { background:#ffffff20; }
+.crew-amount { display:block; font-size:clamp(2.5rem,4vw,4.2rem); line-height:1.06; margin:22px 0 7px; letter-spacing:-.045em; font-variant-numeric:tabular-nums; overflow-wrap:anywhere; }
+.crew-revenue p { margin:0 0 22px; color:#e0ebe2; }
+.crew-counts { display:grid; grid-template-columns:1fr 1fr; margin:auto 0 0; padding-top:15px; border-top:1px solid #ffffff38; }
+.crew-counts dt,.crew-schedule p { font-size:.9rem; }
+.crew-counts dt { color:#d6e6da; }
+.crew-counts dd { margin:3px 0 0; font-size:1.4rem; font-weight:650; }
+.crew-schedule,.crew-shortcuts a { background:white; border:1px solid #d9e1d9; }
+.crew-heading>span { font-size:.8rem; color:#5b695f; }
+.crew-slot { padding:12px 0; border-bottom:1px solid #e5e9e4; }
+.crew-slot:first-of-type { margin-top:8px; }
+.crew-slot svg { color:#687a6b; }
+.crew-slot.in-hours svg { color:#217249; }
+.crew-slot span { margin-left:auto; font-variant-numeric:tabular-nums; }
+.crew-schedule p { margin:16px 0 9px; }
+.crew-primary { width:100%; justify-content:center; min-height:44px; border:0; border-radius:9px; background:#21553f; color:white; font:inherit; font-weight:650; cursor:pointer; }
+.crew-primary:hover { background:#153c2c; }
+.crew-primary:disabled,.crew-icon:disabled { opacity:.55; cursor:default; }
+.crew-shortcuts { margin-top:30px; }
+.crew-shortcuts>div { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:12px; margin-top:14px; }
+.crew-shortcuts a { min-height:60px; padding:12px 17px; color:#224332; text-decoration:none; border-radius:12px; }
+.crew-shortcuts a:hover { border-color:#6b9076; background:#f4f8f3; }
+.crew-shortcuts a svg:last-child { margin-left:auto; }
+.crew-error { padding:12px; color:#812e21; background:#feeee8; border-radius:9px; }
+@media(max-width:880px) {
+  .sfx-shell--staff.sfx-shell--expanded .sfx-main,.sfx-shell--staff.sfx-shell--collapsed .sfx-main { margin-left:0; }
+}
+@media(max-width:690px) {
+  .crew-overview,.crew-shortcuts>div { grid-template-columns:1fr; }
+  .crew-overview { gap:14px; }
+  .crew-shortcuts>div { gap:8px; }
+}

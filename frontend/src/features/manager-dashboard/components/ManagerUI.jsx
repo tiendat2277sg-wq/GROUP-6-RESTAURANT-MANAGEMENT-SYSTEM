@@ -1,0 +1,119 @@
+import { useLanguage } from '@/core/i18n/LanguageProvider.jsx';
+/* Small reusable primitives shared across manager dashboard sections. */
+import Icon from "./ManagerIcons.jsx";
+
+export function StatusBadge({ tone = "muted", color, children }) {
+  if (color) {
+    return <span className={`sfx-badge ${color}`}>{children}</span>;
+  }
+  return <span className={`sfx-badge sfx-badge--${tone}`}>{children}</span>;
+}
+
+export function SectionHead({ title, subtitle, actions, children }) {
+  const { translateLabel } = useLanguage();
+  return (
+    <div className="manager-card manager-page-intro">
+      <div className="sfx-sechead">
+        <div>
+          <h2 className="sfx-sechead__title">{translateLabel(title)}</h2>
+          {subtitle ? <p className="sfx-sechead__sub">{translateLabel(subtitle)}</p> : null}
+        </div>
+        {actions ? <div className="sfx-sechead__actions">{actions}</div> : null}
+      </div>
+      {children}
+    </div>
+  );
+}
+
+export function ContentPanel({ children, className = "", compact = false }) {
+  const classes = [
+    "sfx-card",
+    compact ? "sfx-card--compact" : "",
+    "sfx-card--flush",
+    className,
+  ]
+    .filter(Boolean)
+    .join(" ");
+
+  return <div className={classes}>{children}</div>;
+}
+
+export function Toolbar({ children }) {
+  return <div className="sfx-toolbar">{children}</div>;
+}
+
+export function SearchField({ value, onChange, placeholder = "Search…" }) {
+  return (
+    <label className="sfx-search">
+      <Icon name="search" size={16} />
+      <input
+        type="text"
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        placeholder={placeholder}
+      />
+    </label>
+  );
+}
+
+export function Button({
+  children,
+  onClick,
+  variant = "ghost",
+  size = "md",
+  icon,
+  type = "button",
+  disabled = false,
+  className = "",
+  ...props
+}) {
+  return (
+    <button
+      type={type}
+      className={`sfx-btn sfx-btn--${variant} sfx-btn--${size} ${className}`.trim()}
+      onClick={onClick}
+      disabled={disabled}
+      {...props}
+    >
+      {icon ? <Icon name={icon} size={size === "sm" ? 14 : 16} /> : null}
+      {children ? <span>{children}</span> : null}
+    </button>
+  );
+}
+
+export function EmptyState({ icon = "search", title, hint }) {
+  const { translateLabel } = useLanguage();
+  return (
+    <div className="sfx-empty">
+      <span className="sfx-empty__icon">
+        <Icon name={icon} size={22} />
+      </span>
+      <p className="sfx-empty__title">{translateLabel(title)}</p>
+      {hint ? <p className="sfx-empty__hint">{hint}</p> : null}
+    </div>
+  );
+}
+
+export function Card({ title, action, children, className = "" }) {
+  const { translateLabel } = useLanguage();
+  return (
+    <section className={`sfx-card ${className}`}>
+      {(title || action) && (
+        <header className="sfx-card__head">
+          {title ? <h3 className="sfx-card__title">{translateLabel(title)}</h3> : <span />}
+          {action || null}
+        </header>
+      )}
+      <div className="sfx-card__body">{children}</div>
+    </section>
+  );
+}
+
+export function NotConnectedNote({ children }) {
+  return (
+    <div className="sfx-note">
+      <Icon name="spark" size={15} />
+      <span>{children}</span>
+    </div>
+  );
+}

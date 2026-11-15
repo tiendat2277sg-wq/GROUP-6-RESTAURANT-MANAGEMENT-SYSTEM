@@ -1,0 +1,154 @@
+/* Membership forms, scoped to keep OTP and password recovery layouts independent. */
+.auth-modal__dialog.fuku-auth-dialog{width:min(1280px,calc(100vw - 48px));height:min(850px,calc(100dvh - 48px));max-height:calc(100dvh - 48px);padding:0;border:0;border-radius:24px;overflow:auto;background:#faf7f0}
+.fuku-auth{--auth-ink:#171512;--auth-paper:#faf7f0;--auth-line:#cfc5b3;display:grid;grid-template-columns:56.5% 43.5%;min-height:100%;color:var(--auth-ink);background:var(--auth-paper);font-family:var(--font-body),sans-serif}
+.fuku-auth.fuku-auth--register{grid-template-columns:36.5% 63.5%}
+.fuku-auth__main{min-width:0;padding:clamp(36px,4vw,68px) clamp(32px,5vw,92px);display:flex;flex-direction:column;justify-content:center}
+.fuku-auth--register .fuku-auth__main{grid-column:2;grid-row:1;padding:64px clamp(30px,4vw,70px) 40px}
+.fuku-auth .auth-form{display:flex;position:static;flex-direction:column;width:100%;height:auto;padding:0;gap:22px;opacity:1;visibility:visible;transform:none;pointer-events:auto;overflow:visible;text-align:left}
+.fuku-auth .auth-form__header{margin:0 0 12px}
+.fuku-auth__eyebrow{display:flex;align-items:center;gap:16px;text-transform:uppercase;letter-spacing:4px;font-size:11px;font-weight:700;margin:0 0 20px;color:#25231f}
+.fuku-auth__eyebrow:before{content:"";width:30px;height:1px;background:currentColor}
+.fuku-auth .fuku-auth__title{font-family:"Playfair Display",var(--font-serif),serif;font-size:clamp(38px,4.8vw,68px);font-weight:400;line-height:1.13;letter-spacing:-1.5px;margin:0 0 20px;color:var(--auth-ink)}
+.fuku-auth__title em{font-weight:400}
+.fuku-auth__intro{font-size:16px;line-height:1.65;color:#686155;margin:0;max-width:510px}
+.fuku-auth .auth-field{gap:10px;min-width:0;margin:0}
+.fuku-auth .auth-field__label{font-family:inherit;font-size:11px;font-weight:700;letter-spacing:2.4px;text-transform:uppercase;color:#47423a;margin:0;line-height:1.5}
+.fuku-auth__field-heading{display:flex;align-items:baseline;justify-content:space-between;gap:12px}
+.fuku-auth .auth-field .auth-field__input{box-sizing:border-box;width:100%;height:44px;min-height:44px;padding:8px 0;border:0;border-bottom:1px solid var(--auth-line);border-radius:0;background:transparent;box-shadow:none;color:var(--auth-ink);font-size:17px;font-family:inherit;outline:none}
+.fuku-auth .auth-field__input::placeholder{color:#968d7d;opacity:1}
+.fuku-auth .auth-field__input:focus{border-bottom-color:#27221b;box-shadow:0 1px 0 #27221b}
+.fuku-auth .auth-password{background:none;border:0;border-radius:0;box-shadow:none;position:relative}
+.fuku-auth .auth-password .auth-field__input{padding-right:38px}
+.fuku-auth .auth-password__toggle{right:0;width:32px;height:40px;color:#5b5449;background:transparent}
+.fuku-auth .auth-password--error .auth-field__input,.fuku-auth .auth-field__input--error{border-bottom-color:#b23c2c}
+.fuku-auth .auth-field__error{font-size:12px;margin:4px 0 0;line-height:1.4;color:#aa3025}
+.fuku-auth__forgot{background:none;border:0;padding:0;text-decoration:underline;text-underline-offset:4px;font:italic 16px "Playfair Display",serif;color:#62594b;cursor:pointer;white-space:nowrap}
+.fuku-auth .auth-form__row{display:flex;margin:0;gap:10px}
+.fuku-auth .auth-checkbox{font-size:14px;line-height:1.6;display:flex;gap:12px;align-items:flex-start;color:#514b41;letter-spacing:0}
+.fuku-auth .auth-checkbox input{width:18px;height:18px;flex-shrink:0;margin:2px 0 0;accent-color:#191613;cursor:pointer}
+.fuku-auth .auth-submit,.fuku-auth .auth-socials__btn{width:100%;min-height:54px;margin:0;border-radius:0;box-shadow:none;padding:14px 18px;display:flex;align-items:center;justify-content:center;gap:12px;font-family:inherit;font-size:14px;cursor:pointer}
+.fuku-auth .auth-submit{background:#151310!important;color:#faf7f0!important;border:1px solid #151310;letter-spacing:3px;font-weight:700;text-transform:uppercase}
+.fuku-auth .auth-submit:hover{background:#332d25!important}
+.fuku-auth .auth-socials__btn{background:transparent!important;color:#201c17!important;border:1px solid #474137;font-weight:600;text-transform:none;letter-spacing:0}
+.fuku-auth .auth-socials__icon{width:20px;height:20px}
+.fuku-auth button:disabled{opacity:.55;cursor:wait}
+.fuku-auth button:focus-visible{outline:2px solid #998266;outline-offset:4px}
+.fuku-auth__divider{display:flex;align-items:center;gap:18px;margin:-8px 0;color:#8e8371;font:italic 16px "Playfair Display",serif}
+.fuku-auth__divider:before,.fuku-auth__divider:after{content:"";height:1px;flex:1;background:#e0d7c8}
+.fuku-auth__switch{font-size:14px;color:#746a5b;margin:28px 0 0;line-height:1.6}
+.fuku-auth__switch button{border:0;background:none;padding:0;font:600 14px var(--font-body),sans-serif;color:#24201b;text-decoration:underline;text-underline-offset:4px;cursor:pointer}
+.fuku-auth__brand-panel{position:relative;isolation:isolate;background:#141310;color:#eee7d5;padding:58px;display:flex;flex-direction:column;justify-content:space-between;min-width:0;min-height:100%;box-sizing:border-box}
+.fuku-auth--register .fuku-auth__brand-panel{grid-column:1;grid-row:1;padding:58px 44px}
+.fuku-auth__brand-panel:before,.fuku-auth__brand-panel:after{content:"";position:absolute;inset:24px;border:1px solid #4c4639;pointer-events:none;z-index:-1}
+.fuku-auth__brand-panel:after{inset:31px;border-color:#2d2922}
+.fuku-auth__wordmark{font:24px "Playfair Display",serif;letter-spacing:10px;margin-left:5px}
+.fuku-auth__brand-content{text-align:center;margin:36px 0;display:flex;flex-direction:column;align-items:center}
+.fuku-auth__kanji{font-family:"Yu Mincho","MS Mincho","Noto Serif CJK JP",serif;font-size:clamp(110px,12vw,190px);font-weight:400;line-height:1.1}
+.fuku-auth__ornament{display:flex;align-items:center;gap:14px;font-size:9px;color:#998a6f;margin:22px 0 28px}
+.fuku-auth__ornament:before,.fuku-auth__ornament:after{content:"";width:48px;height:1px;background:#625742}
+.fuku-auth__brand-content h2{font:italic 400 clamp(27px,2.8vw,39px)/1.35 "Playfair Display",serif;margin:0 0 24px;color:#eee7d5}
+.fuku-auth__brand-content p{font-size:16px;line-height:1.8;color:#c0b7a3;margin:0 0 34px;max-width:360px}
+.fuku-auth__brand-content button{border:1px solid #c8bfab;background:none;color:#eee7d5;min-height:52px;padding:14px 25px;font:700 13px var(--font-body),sans-serif;text-transform:uppercase;letter-spacing:3px;cursor:pointer;max-width:100%}
+.fuku-auth__tagline{text-align:center;font:italic 17px "Playfair Display",serif;color:#9d9079}
+.fuku-auth .auth-form__grid--2{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:28px}
+.fuku-auth .auth-form__grid .auth-form__full{grid-column:auto}
+.fuku-auth__birthday-note{align-self:center;color:#8a7f6c;font:italic 15px/1.7 "Playfair Display",serif;margin:0}
+.fuku-auth .auth-form__password-col{display:flex;flex-direction:column;gap:10px;min-width:0}
+.fuku-auth .auth-strength{margin:0}
+.fuku-auth .auth-strength__bar{height:3px;background:#dfd6c5}
+.fuku-auth .auth-strength__bar--weak,.fuku-auth .auth-strength__bar--medium,.fuku-auth .auth-strength__bar--strong{background:#4d4436}
+.fuku-auth .auth-strength__label{font-size:11px;color:#736957;margin:5px 0 0}
+.fuku-auth__register-actions{display:grid;grid-template-columns:1fr 1fr;gap:18px}
+.fuku-auth--register .auth-form__header{margin-bottom:8px}
+.fuku-auth--register .fuku-auth__title{font-size:clamp(34px,3.6vw,51px)}
+.fuku-auth--register .fuku-auth__switch{display:none}
+.fuku-auth-dialog .auth-modal__close{top:24px;right:24px;width:44px;height:44px;background:transparent;border:1px solid #786c56;color:#eee7d5;font-weight:300;z-index:30}
+.fuku-auth-dialog:has(.fuku-auth--register) .auth-modal__close{color:#252018;border-color:#cec2ad}
+@media(max-width:900px){
+ .auth-modal__dialog.fuku-auth-dialog{width:calc(100vw - 24px);height:calc(100dvh - 24px);max-height:calc(100dvh - 24px)}
+ .fuku-auth__main{padding:42px 32px}.fuku-auth__brand-panel{padding:48px 30px}.fuku-auth__brand-content p{font-size:14px}
+ .fuku-auth--register .fuku-auth__main{padding:72px 28px 32px}.fuku-auth--register .fuku-auth__brand-panel{padding:48px 30px}
+ .fuku-auth .auth-form__grid--2{gap:18px}.fuku-auth__register-actions{grid-template-columns:1fr;gap:12px}
+}
+@media(max-width:700px){
+ .auth-modal__dialog.fuku-auth-dialog{width:calc(100vw - 20px);height:auto;max-height:calc(100dvh - 20px);border-radius:20px}
+ .fuku-auth,.fuku-auth.fuku-auth--register{display:flex;flex-direction:column;min-height:0}
+ .fuku-auth__brand-panel{display:none}.fuku-auth__main,.fuku-auth--register .fuku-auth__main{padding:58px 26px 30px}
+ .fuku-auth .auth-form{gap:22px}.fuku-auth .fuku-auth__title{font-size:45px}.fuku-auth__intro{font-size:14px}
+ .fuku-auth__eyebrow{font-size:10px;letter-spacing:2.5px;margin-bottom:18px}
+ .fuku-auth-dialog .auth-modal__close{top:12px;right:12px;width:34px;height:34px;color:#252018;border-color:#cec2ad}
+ .fuku-auth .auth-form__grid--2{grid-template-columns:1fr;gap:22px}.fuku-auth__birthday-note{margin-top:-12px;font-size:13px}
+ .fuku-auth--register .fuku-auth__switch{display:block}.fuku-auth .auth-field .auth-field__input{font-size:16px}
+ .fuku-auth .auth-field__label{font-size:10px;letter-spacing:1.8px}.fuku-auth__forgot{font-size:14px}
+ .fuku-auth .auth-form__row{flex-direction:row}.fuku-auth .auth-checkbox{font-size:13px}.fuku-auth__register-actions{grid-template-columns:1fr}
+}
+@media(prefers-reduced-motion:reduce){.fuku-auth-dialog{animation:none}}
+.fuku-auth .fuku-auth__title,.fuku-auth__brand-content h2,.fuku-auth__wordmark,.fuku-auth__tagline,.fuku-auth__birthday-note,.fuku-auth__forgot,.fuku-auth__divider{font-family:"Playfair Display",var(--font-serif),serif!important}
+.fuku-auth__kanji{font-family:"Yu Mincho","MS Mincho","Noto Serif CJK JP",serif!important}
+/* Compact desktop membership card: keep all actions within a laptop viewport. */
+@media (min-width:901px) {
+ .auth-modal__dialog.fuku-auth-dialog{width:min(1080px,calc(100vw - 48px));height:min(700px,calc(100dvh - 40px));max-height:calc(100dvh - 40px)}
+ .fuku-auth{height:100%;min-height:0}
+ .fuku-auth__main,.fuku-auth--register .fuku-auth__main{padding:36px 48px;box-sizing:border-box}
+ .fuku-auth-dialog .fuku-auth .auth-form{gap:12px}
+ .fuku-auth-dialog .fuku-auth .auth-form__header{margin:0 0 6px}
+ .fuku-auth__eyebrow{font-size:10px;letter-spacing:3px;margin-bottom:12px}
+ .fuku-auth .fuku-auth__title{font-size:48px;margin-bottom:14px;line-height:1.08}
+ .fuku-auth--register .fuku-auth__title{font-size:40px;margin-bottom:12px}
+ .fuku-auth__intro{font-size:14px;line-height:1.55}
+ .fuku-auth-dialog .fuku-auth .auth-field{gap:5px}
+ .fuku-auth-dialog .fuku-auth .auth-field__label{font-size:10px;letter-spacing:1.8px}
+ .fuku-auth-dialog .fuku-auth .auth-field .auth-field__input{height:38px;min-height:38px;padding:6px 0;font-size:15px}
+ .fuku-auth .auth-password__toggle{height:36px}
+ .fuku-auth-dialog .fuku-auth .auth-checkbox{font-size:12px;line-height:1.5;gap:10px}
+ .fuku-auth-dialog .fuku-auth .auth-submit,.fuku-auth-dialog .fuku-auth .auth-socials__btn{min-height:44px;padding:10px 14px;font-size:12px}
+ .fuku-auth__divider{font-size:14px;margin:-3px 0}
+ .fuku-auth__switch{font-size:12px;margin-top:16px}
+ .fuku-auth__switch button{font-size:12px}
+ .fuku-auth__brand-panel,.fuku-auth--register .fuku-auth__brand-panel{min-height:0;padding:36px 34px}
+ .fuku-auth__brand-content{margin:20px 0}
+ .fuku-auth__wordmark{font-size:21px;letter-spacing:8px}
+ .fuku-auth__kanji{font-size:132px}
+ .fuku-auth__ornament{margin:16px 0 20px}
+ .fuku-auth__brand-content h2{font-size:29px;margin-bottom:18px}
+ .fuku-auth__brand-content p{font-size:14px;line-height:1.65;margin-bottom:24px}
+ .fuku-auth__brand-content button{min-height:44px;padding:10px 18px;font-size:11px;letter-spacing:2px}
+ .fuku-auth__tagline{font-size:15px}
+ .fuku-auth .auth-form__grid--2{gap:22px}
+ .fuku-auth__birthday-note{font-size:13px}
+ .fuku-auth__register-actions{gap:14px}
+ .fuku-auth-dialog .auth-modal__close{width:34px;height:34px;top:18px;right:18px}
+}
+@media (min-width:901px) and (max-height:700px) {
+ .fuku-auth__main,.fuku-auth--register .fuku-auth__main{padding:24px 40px}
+ .fuku-auth-dialog .fuku-auth .auth-form{gap:10px}
+ .fuku-auth .fuku-auth__title{font-size:40px;margin-bottom:10px}
+ .fuku-auth--register .fuku-auth__title{font-size:34px}
+ .fuku-auth__intro{font-size:13px}
+ .fuku-auth__eyebrow{margin-bottom:10px}
+ .fuku-auth__kanji{font-size:112px}
+ .fuku-auth__brand-content h2{font-size:26px}
+ .fuku-auth__switch{margin-top:12px}
+}
+/* Slide the brand panel across the card while the active form moves opposite it. */
+@media (min-width:701px) {
+ .fuku-auth,.fuku-auth.fuku-auth--register{display:block;position:relative;isolation:isolate}
+ .fuku-auth .fuku-auth__main{width:56.5%;margin-left:0;min-height:100%;transition:margin-left .65s cubic-bezier(.22,.68,.2,1),width .65s cubic-bezier(.22,.68,.2,1)}
+ .fuku-auth.fuku-auth--register .fuku-auth__main{width:63.5%;margin-left:36.5%}
+ .fuku-auth .fuku-auth__brand-panel{position:absolute;top:0;bottom:0;left:56.5%;width:43.5%;min-height:0;z-index:2;transition:left .65s cubic-bezier(.22,.68,.2,1),width .65s cubic-bezier(.22,.68,.2,1)}
+ .fuku-auth.fuku-auth--register .fuku-auth__brand-panel{left:0;width:36.5%}
+ .fuku-auth--register .auth-form{animation:fuku-auth-enter-right .6s both}
+ .fuku-auth--login .auth-form{animation:fuku-auth-enter-left .6s both}
+ .fuku-auth__brand-content{animation:fuku-auth-copy-in .5s both}
+}
+@media (max-width:700px) {
+ .fuku-auth--register .auth-form{animation:fuku-auth-enter-right .35s both}
+ .fuku-auth--login .auth-form{animation:fuku-auth-enter-left .35s both}
+}
+@keyframes fuku-auth-enter-right{from{opacity:0;transform:translateX(24px)}to{opacity:1;transform:translateX(0)}}
+@keyframes fuku-auth-enter-left{from{opacity:0;transform:translateX(-24px)}to{opacity:1;transform:translateX(0)}}
+@keyframes fuku-auth-copy-in{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:translateY(0)}}
+@media (prefers-reduced-motion:reduce){
+ .fuku-auth .fuku-auth__main,.fuku-auth .fuku-auth__brand-panel{transition-duration:.2s}
+ .fuku-auth .auth-form,.fuku-auth__brand-content{animation:none}
+}

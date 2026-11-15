@@ -1,0 +1,37 @@
+import { useLanguage } from '@/core/i18n/LanguageProvider.jsx';
+import { createPortal } from "react-dom";
+import { getDisplayName } from "../utils/authHelpers.js";
+
+function AuthSuccessOverlay({ isVisible, user, fading = false }) {
+  const { language } = useLanguage();
+  if (!isVisible) {
+    return null;
+  }
+  const displayName = user?.username?.trim() || getDisplayName(user);
+  const greeting = language === "vi" ? "Xin Chào" : "Hello";
+
+  return createPortal(
+    <div
+      className={`auth-welcome${fading ? " auth-welcome--fade-out" : ""}`}
+      role="dialog"
+      aria-live="polite"
+      aria-labelledby="auth-welcome-greeting"
+    >
+      <div className="auth-welcome__backdrop" aria-hidden="true" />
+      <div className="auth-welcome__content">
+        <div className="auth-welcome__check" aria-hidden="true">
+          <svg viewBox="0 0 52 52">
+            <circle className="auth-welcome__check-circle" cx="26" cy="26" r="25" fill="none" />
+            <path className="auth-welcome__check-mark" fill="none" d="M14 27l7 7 16-16" />
+          </svg>
+        </div>
+        <p id="auth-welcome-greeting" className="auth-welcome__line">
+          {greeting} <span className="auth-welcome__name">{displayName}</span>
+        </p>
+      </div>
+    </div>,
+    document.body
+  );
+}
+
+export default AuthSuccessOverlay;

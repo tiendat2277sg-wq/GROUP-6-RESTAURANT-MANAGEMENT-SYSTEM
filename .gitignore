@@ -22,3 +22,24 @@
 !/.env.example
 !/README.md
 !/.gitignore
+
+# FUKU frontend and versioned SQL scripts
+!/frontend/
+!/frontend/**
+!/database/
+!/database/**
+
+# Private files and generated output remain excluded
+**/node_modules/
+**/dist/
+**/dist-check/
+**/.git/
+.env*
+*.local
+*.bak
+*.zip
+*.log
+*.pem
+*.key
+*.pfx
+*.p12

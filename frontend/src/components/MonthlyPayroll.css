@@ -1,0 +1,12 @@
+.fuku-payroll { margin:20px 0; padding:24px; background:white; border:1px solid #d9e1d9; border-radius:16px; color:#21392e; }
+.fuku-payroll__header,.fuku-payroll__header>div { display:flex; align-items:center; flex-wrap:wrap; gap:8px; }
+.fuku-payroll__header { justify-content:space-between; }
+.fuku-payroll h2 { margin:0; font-size:1.2rem; }
+.fuku-payroll p,.fuku-payroll dt { color:#52645a; }
+.fuku-payroll input,.fuku-payroll button { border:1px solid #bdcdc2; border-radius:7px; padding:8px; color:inherit; background:white; }
+.fuku-payroll dl { display:grid; grid-template-columns:repeat(auto-fit,minmax(125px,1fr)); gap:14px; }
+.fuku-payroll dd { margin:4px 0 0; font-weight:650; }
+.fuku-payroll__scroll { overflow:auto; }
+.fuku-payroll table { width:100%; border-collapse:collapse; font-variant-numeric:tabular-nums; }
+.fuku-payroll th,.fuku-payroll td { padding:10px; border-bottom:1px solid #dde6df; text-align:right; white-space:nowrap; }
+.fuku-payroll tr th:first-child { text-align:left; }

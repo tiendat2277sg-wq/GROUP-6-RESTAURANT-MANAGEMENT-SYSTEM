@@ -1,0 +1,93 @@
+import { useLanguage } from '@/core/i18n/LanguageProvider.jsx';
+import ReservationFormPanel from "./ReservationFormPanel";
+
+/**
+ * Step 1 wrapper around the reservation form. Adds the guided footer actions:
+ *  - Done  (appears only once required fields are valid)
+ *  - Confirm + Cancel (shown after Done; locks the form for review)
+ */
+function ReservationDetailsPanel({
+  form,
+  setField,
+  settings,
+  timeSlots,
+  isAuthenticated,
+  todayStr,
+  detailsValid,
+  reviewing,
+  missing = [],
+  onDone,
+  onConfirm,
+  onCancel,
+  selectedTableId,
+  onSelectTable,
+  tables,
+  tablesLoading,
+  onNavigateLogin,
+  onNavigateRegister,
+}) {
+  const { translateLabel } = useLanguage();
+  return (
+    <div className={`rzv-details ${reviewing ? "rzv-details--review" : ""}`}>
+      <div className="rzv-details__form" aria-disabled={reviewing}>
+        <ReservationFormPanel
+          form={form}
+          setField={setField}
+          settings={settings}
+          timeSlots={timeSlots}
+          isAuthenticated={isAuthenticated}
+          todayStr={todayStr}
+          selectedTableId={selectedTableId}
+          onSelectTable={onSelectTable}
+          tables={tables}
+          tablesLoading={tablesLoading}
+          onNavigateLogin={onNavigateLogin}
+          onNavigateRegister={onNavigateRegister}
+        />
+      </div>
+
+      <div className="rzv-details__footer">
+        {form.holdDurationMinutes === 45 || form.holdDurationMinutes === 60 ? (
+          <div className="rzv-alert rzv-alert--surcharge" role="status">
+            {translateLabel("Note: Reservations for 45 minutes or 1 hour are subject to an additional premium VAT/surcharge fee.")}
+          </div>
+        ) : null}
+
+        {!reviewing ? (
+          detailsValid ? (
+            <div className="rzv-details__ready">
+              <span className="rzv-details__ready-note">{translateLabel("Looks good — your details are ready.")}</span>
+              <button type="button" className="rzv-btn rzv-btn--solid rzv-details__done" onClick={onDone}>
+                {translateLabel("Done")}
+              </button>
+            </div>
+          ) : (
+            <p className="rzv-details__hint">
+              {missing.length > 0
+                ? `Please add: ${missing.join(", ")}.`
+                : "Complete the required fields to continue."}
+            </p>
+          )
+        ) : (
+          <div className="rzv-details__review">
+            <span className="rzv-details__review-note">
+              {translateLabel(form.selectedArea === "Kitchen View"
+                ? "Details locked for review. Confirm to reserve counter seats."
+                : "Details locked for review. Confirm to choose your table.")}
+            </span>
+            <div className="rzv-details__review-actions">
+              <button type="button" className="rzv-btn rzv-btn--ghost" onClick={onCancel}>
+                {translateLabel("Cancel")}
+              </button>
+              <button type="button" className="rzv-btn rzv-btn--solid" onClick={onConfirm}>
+                {translateLabel("Confirm")}
+              </button>
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+export default ReservationDetailsPanel;
