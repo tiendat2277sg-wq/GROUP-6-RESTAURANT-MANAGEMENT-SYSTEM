@@ -1,5 +1,5 @@
 {
-  "name": "phurai-ui",
+  "name": "fuku-ui",
   "private": true,
   "version": "0.0.0",
   "type": "module",
@@ -17,10 +17,18 @@
     "start": "node backend/src/index.js",
     "check:local": "node scripts/verify-local.mjs",
     "build:vercel": "node scripts/build-vercel.mjs",
-    "check:vercel": "node scripts/check-vercel.mjs"
+    "check:vercel": "node scripts/check-vercel.mjs",
+    "prepare:deploy": "node scripts/prepare-deploy.mjs",
+    "check:deploy": "node scripts/check-deploy.mjs",
+    "test:deploy": "node --test scripts/deploy-env.test.mjs",
+    "test:staff": "node --test scripts/test-staff-helpers.mjs",
+    "test:backend": "node --test \"backend/test/*.test.mjs\"",
+    "find:unused": "node scripts/find-unused-frontend.mjs",
+    "package:deploy": "node scripts/package-deploy.mjs"
   },
   "dependencies": {
     "@google/generative-ai": "^0.24.1",
+    "@payos/node": "^2.0.5",
     "@socket.io/redis-adapter": "^8.3.0",
     "@vercel/blob": "^2.8.2",
     "bcryptjs": "^3.0.3",
@@ -57,6 +65,8 @@
     "zustand": "^5.0.14"
   },
   "devDependencies": {
+    "@emnapi/core": "^1.11.3",
+    "@emnapi/runtime": "^1.11.3",
     "@eslint/js": "^10.0.1",
     "@types/react": "^19.2.14",
     "@types/react-dom": "^19.2.3",
