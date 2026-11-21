@@ -1,0 +1,1110 @@
+import pool from "../db.js";
+import { assertItemsAllowedForTables, isOmakaseAreaName, PolicyError, sendPolicyError } from "../utils/areaDishPolicy.js";
+
+const SESSION_SELECT = `
+  SELECT TOP 1
+    qs.qr_session_id AS session_id,
+    qs.table_id,
+    qs.token,
+    qs.session_status,
+    qs.expires_at,
+    qs.customer_id,
+    qs.reservation_id,
+    t.table_number,
+    t.table_status,
+    t.static_qr_code,
+    a.area_name
+  FROM dbo.QROrderSessions AS qs
+  INNER JOIN dbo.RestaurantTables AS t ON qs.table_id = t.table_id
+  LEFT JOIN dbo.RestaurantAreas AS a ON t.area_id = a.area_id
+`;
+
+function mapSessionRow(row) {
+  if (!row) return null;
+
+  return {
+    session_id: row.session_id,
+    table_id: row.table_id,
+    token: row.token,
+    session_status: row.session_status,
+    expires_at: row.expires_at,
+    customer_id: row.customer_id,
+    reservation_id: row.reservation_id ?? null,
+    table_number: row.table_number,
+    table_status: row.table_status,
+    static_qr_code: row.static_qr_code,
+    area_name: row.area_name ?? null,
+  };
+}
+
+// A table can be reused many times per day.  Always resolve the reservation
+// from its assigned table *and* active dining window; never infer it from the
+// latest reservation ID alone.
+async function findCurrentReservationForTable(connection, tableId) {
+  const [rows] = await connection.query(
+    `SELECT TOP 1 r.reservation_id, r.customer_id, r.dining_purpose
+     FROM dbo.ReservationTables rt
+     JOIN dbo.Reservations r ON r.reservation_id = rt.reservation_id
+     WHERE rt.table_id = ?
+       AND r.reservation_status IN (N'Check-in', N'Dining')
+       AND SYSDATETIME() >= DATEADD(minute, -30, r.reservation_start_at)
+       AND SYSDATETIME() <= DATEADD(hour, 3, r.reservation_end_at)
+     ORDER BY r.reservation_start_at DESC, r.reservation_id DESC`,
+    [tableId]
+  );
+
+  return rows[0] || null;
+}
+
+const MULTI_TABLE_PURPOSES = new Set([
+  "birthday", "business meeting", "family gathering", "special occasion", "private party",
+]);
+
+// The first QR scan of a checked-in reservation that holds several tables turns its selected
+// tables into one physical group. Every child QR then resolves to this primary
+// table, giving the entire party one bill and one QR session.
+async function ensureEventTablesMergedForQr(connection, reservation, fallbackTableId) {
+  if (!reservation) {
+    return fallbackTableId;
+  }
+
+  const [rows] = await connection.query(
+    `SELECT rt.table_id
+     FROM dbo.ReservationTables rt
+     WHERE rt.reservation_id = ?
+     ORDER BY rt.table_id`,
+    [reservation.reservation_id]
+  );
+  if (rows.length < 2) return fallbackTableId;
+
+  const primaryTableId = Number(rows[0].table_id);
+  const childTableIds = rows.map((row) => Number(row.table_id)).filter((id) => id !== primaryTableId);
+  if (childTableIds.length) {
+    const placeholders = childTableIds.map(() => "?").join(", ");
+    await connection.query(
+      `UPDATE dbo.RestaurantTables
+       SET merged_into_table_id = ?, table_status = N'Inactive', updated_at = SYSDATETIME()
+       WHERE table_id IN (${placeholders})
+         AND merged_into_table_id IS NULL`,
+      [primaryTableId, ...childTableIds]
+    );
+  }
+  return primaryTableId;
+}
+
+/**
+ * GET /api/customer/qr-sessions/active
+ * Returns the logged-in customer's active dine-in QR session, if any.
+ */
+export async function getActiveSession(req, res) {
+  try {
+    const userId = req.userId;
+
+    const [rows] = await pool.query(
+      `${SESSION_SELECT}
+       WHERE qs.customer_id = ?
+         AND qs.session_status = N'Active'
+         AND (qs.expires_at IS NULL OR qs.expires_at > SYSDATETIME())
+       ORDER BY qs.generated_at DESC;`,
+      [userId]
+    );
+
+    const session = mapSessionRow(rows[0]) ?? null;
+
+    return res.json({
+      success: true,
+      hasActiveSession: Boolean(session),
+      session,
+    });
+  } catch (error) {
+    console.error("getActiveSession failed:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Could not load active table session.",
+    });
+  }
+}
+
+/**
+ * GET /api/customer/qr-sessions/validate?table_id=&session_id=
+ * Confirms a table/session pair is active (QR scan or deep link).
+ */
+export async function validateSession(req, res) {
+  res.set("Cache-Control", "private, no-store");
+  try {
+    const tableId = Number(req.query.table_id);
+    const raw = req.query.session_token ?? req.query.session_id ?? req.query.sessionId;
+    if (!Number.isInteger(tableId) || tableId <= 0 || typeof raw !== "string" || !raw.trim() || raw.length > 120) {
+      return res.status(400).json({success:false, message:"Invalid table session link."});
+    }
+    const legacyId = req.query.session_token == null && /^\d+$/.test(raw);
+    if (legacyId && !req.userId) return res.status(401).json({success:false, message:"Sign in or scan the table QR again."});
+    const predicate = legacyId ? "qs.qr_session_id = TRY_CONVERT(int, ?) AND qs.customer_id = ?" : "qs.token = ?";
+    const params = legacyId ? [tableId, raw, req.userId] : [tableId, raw];
+    const query = `${SESSION_SELECT} WHERE qs.table_id = ? AND qs.session_status = N'Active'
+      AND (qs.expires_at IS NULL OR qs.expires_at > SYSDATETIME()) AND ${predicate}`;
+    const [rows] = await pool.query(query, params);
+    const session = mapSessionRow(rows[0]);
+    if (!session) {
+      return res.status(404).json({
+        success: false,
+        message: "This table session is not active or has expired.",
+      });
+    }
+
+    return res.json({
+      success: true,
+      session,
+    });
+  } catch (error) {
+    console.error("validateSession failed:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Could not validate table session.",
+    });
+  }
+}
+
+/**
+ * POST /api/customer/qr-sessions/scan
+ * Body: { table_id }
+ * Resolves static QR scan, applying merged table rules and counter restrictions.
+ */
+export async function scanStaticQr(req, res) {
+  try {
+    const tableId = Number(req.body.table_id);
+    if (!Number.isFinite(tableId) || tableId <= 0) {
+      return res.status(400).json({ success: false, message: "Invalid table ID." });
+    }
+
+    // 1. Fetch table details
+    const [tables] = await pool.query(`
+      SELECT t.table_id, t.is_counter, t.table_status, t.merged_into_table_id, a.area_name
+      FROM dbo.RestaurantTables t
+      LEFT JOIN dbo.RestaurantAreas a ON a.area_id = t.area_id
+      WHERE t.table_id = ?
+    `, [tableId]);
+
+    if (!tables || tables.length === 0) {
+      return res.status(404).json({ success: false, message: "Table not found." });
+    }
+
+    const table = tables[0];
+
+    // Rule 1: Resolve merged table first (if merged into a main table)
+    const resolvedTableId = table.merged_into_table_id ? table.merged_into_table_id : table.table_id;
+
+    // Fetch effective main table details for status check
+    const [effectiveTables] = await pool.query(`
+      SELECT t.table_id, t.is_counter, t.table_status, a.area_name
+      FROM dbo.RestaurantTables t
+      LEFT JOIN dbo.RestaurantAreas a ON a.area_id = t.area_id
+      WHERE t.table_id = ?
+    `, [resolvedTableId]);
+
+    const effectiveTable = effectiveTables[0] || table;
+
+    // Enforce Rule: Only Occupied tables (which have active checked-in sessions) can scan QR to order
+    if (effectiveTable.table_status !== 'Occupied'
+      && (!effectiveTable.is_counter || isOmakaseAreaName(effectiveTable.area_name))) {
+      return res.status(403).json({
+        success: false,
+        message: "Table has not been activated. Please contact staff to check-in and activate the table before scanning the QR code to order."
+      });
+    }
+
+    let session = null;
+
+
+    // If Occupied, Find existing active session
+    const [existingSessions] = await pool.query(
+      `${SESSION_SELECT}
+       WHERE qs.table_id = ?
+         AND qs.session_status = N'Active'
+         AND (qs.expires_at IS NULL OR qs.expires_at > SYSDATETIME())
+       ORDER BY qs.generated_at DESC;`,
+      [resolvedTableId]
+    );
+
+    session = mapSessionRow(existingSessions[0]);
+
+    // 3. If no session exists, generate one
+    if (!session) {
+      const crypto = await import('crypto');
+      const token = crypto.randomBytes(32).toString('hex');
+
+      const reservation = await findCurrentReservationForTable(pool, resolvedTableId);
+      const reservationId = reservation?.reservation_id ?? null;
+      const customerId = reservation?.customer_id ?? null;
+      const sessionTableId = await ensureEventTablesMergedForQr(pool, reservation, resolvedTableId);
+
+      const insertResult = await pool.query(`
+        INSERT INTO dbo.QROrderSessions (table_id, scanned_table_id, token, session_status, generated_at, reservation_id, customer_id)
+        OUTPUT INSERTED.qr_session_id
+        VALUES (?, ?, ?, N'Active', SYSDATETIME(), ?, ?)
+      `, [sessionTableId, tableId, token, reservationId, customerId]);
+
+      const newSessionId = insertResult[0][0].qr_session_id;
+
+      const [newSessions] = await pool.query(
+        `${SESSION_SELECT} WHERE qs.qr_session_id = ?`,
+        [newSessionId]
+      );
+      session = mapSessionRow(newSessions[0]);
+      if (sessionTableId !== resolvedTableId) {
+        req.app.get("io")?.to("room:staff").to("room:manager").emit("table:sync", {
+          action: "auto_merge_event_tables", reservation_id: reservationId, table_id: sessionTableId,
+        });
+      }
+    }
+
+    return res.json({
+      success: true,
+      message: table.merged_into_table_id ? "Redirected to primary merged table." : "Session loaded.",
+      session,
+      resolved_table_id: resolvedTableId,
+      was_merged: !!table.merged_into_table_id
+    });
+  } catch (error) {
+    console.error("scanStaticQr failed:", error);
+    return res.status(500).json({ success: false, message: "Could not process QR scan." });
+  }
+}
+
+/**
+ * GET /api/customer/qr-sessions/scan/:qr_code
+ * Resolves static QR code from URL, applying merged table rules and counter restrictions.
+ */
+export async function scanStaticQrCodeUrl(req, res) {
+  try {
+    const qrCode = req.params.qr_code;
+    console.log(`\n\n[QR SCAN RECV] 📲 Someone scanned table QR: ${qrCode}`);
+
+    if (!qrCode || typeof qrCode !== 'string') {
+      return res.status(400).json({ success: false, message: "Invalid QR Code." });
+    }
+
+    // 1. Fetch table details by QR Code
+    const [tables] = await pool.query(`
+      SELECT t.table_id, t.is_counter, t.table_status, t.merged_into_table_id, a.area_name
+      FROM dbo.RestaurantTables t
+      LEFT JOIN dbo.RestaurantAreas a ON a.area_id = t.area_id
+      WHERE t.static_qr_code = ?
+    `, [qrCode]);
+
+    if (!tables || tables.length === 0) {
+      return res.status(404).json({ success: false, message: "Table not found or invalid QR code." });
+    }
+
+    const table = tables[0];
+    const tableId = table.table_id;
+
+    // Rule 1: Resolve merged table first (if merged into a main table)
+    const resolvedTableId = table.merged_into_table_id ? table.merged_into_table_id : table.table_id;
+
+    // Fetch effective main table details for status check
+    const [effectiveTables] = await pool.query(`
+      SELECT t.table_id, t.is_counter, t.table_status, a.area_name
+      FROM dbo.RestaurantTables t
+      LEFT JOIN dbo.RestaurantAreas a ON a.area_id = t.area_id
+      WHERE t.table_id = ?
+    `, [resolvedTableId]);
+
+    const effectiveTable = effectiveTables[0] || table;
+
+    // Enforce Rule: Only Occupied tables (which have active checked-in sessions) can scan QR to order
+    if (effectiveTable.table_status !== 'Occupied'
+      && (!effectiveTable.is_counter || isOmakaseAreaName(effectiveTable.area_name))) {
+      return res.status(403).json({
+        success: false,
+        message: "Table has not been activated. Please contact staff to check-in and activate the table before scanning the QR code to order."
+      });
+    }
+
+    let session = null;
+
+
+    // If Occupied, Find existing active session
+    const [existingSessions] = await pool.query(
+      `${SESSION_SELECT}
+       WHERE qs.table_id = ?
+         AND qs.session_status = N'Active'
+         AND (qs.expires_at IS NULL OR qs.expires_at > SYSDATETIME())
+       ORDER BY qs.generated_at DESC;`,
+      [resolvedTableId]
+    );
+
+    session = mapSessionRow(existingSessions[0]);
+
+    // 3. If no session exists, generate one
+    if (!session) {
+      const crypto = await import('crypto');
+      const token = crypto.randomBytes(32).toString('hex');
+
+      const reservation = await findCurrentReservationForTable(pool, resolvedTableId);
+      const reservationId = reservation?.reservation_id ?? null;
+      const customerId = reservation?.customer_id ?? null;
+      const sessionTableId = await ensureEventTablesMergedForQr(pool, reservation, resolvedTableId);
+
+      const insertResult = await pool.query(`
+        INSERT INTO dbo.QROrderSessions (table_id, scanned_table_id, token, session_status, generated_at, reservation_id, customer_id)
+        OUTPUT INSERTED.qr_session_id
+        VALUES (?, ?, ?, N'Active', SYSDATETIME(), ?, ?)
+      `, [sessionTableId, tableId, token, reservationId, customerId]);
+
+      const newSessionId = insertResult[0][0].qr_session_id;
+
+      const [newSessions] = await pool.query(
+        `${SESSION_SELECT} WHERE qs.qr_session_id = ?`,
+        [newSessionId]
+      );
+      session = mapSessionRow(newSessions[0]);
+      if (sessionTableId !== resolvedTableId) {
+        req.app.get("io")?.to("room:staff").to("room:manager").emit("table:sync", {
+          action: "auto_merge_event_tables", reservation_id: reservationId, table_id: sessionTableId,
+        });
+      }
+    }
+
+    return res.json({
+      success: true,
+      message: table.merged_into_table_id ? "Redirected to primary merged table." : "Session loaded.",
+      session,
+      resolved_table_id: resolvedTableId,
+      was_merged: !!table.merged_into_table_id
+    });
+  } catch (error) {
+    console.error("scanStaticQrCodeUrl failed:", error);
+    return res.status(500).json({ success: false, message: "Could not process QR scan." });
+  }
+}
+
+/**
+ * PATCH /api/sessions/:id/approve
+ * Staff/Manager approves a pending QR session.
+ * Updates session to Active, table to Occupied, and emits Socket.IO event.
+ */
+export async function approveQrSession(req, res) {
+  let conn;
+  let transactionStarted = false;
+  let transactionCommitted = false;
+
+  try {
+    conn = await pool.getConnection();
+    const sessionId = Number(req.params.id);
+    if (!Number.isFinite(sessionId) || sessionId <= 0) {
+      return res.status(400).json({ success: false, message: "Invalid session ID." });
+    }
+
+    await conn.beginTransaction();
+    transactionStarted = true;
+
+    // 1. Verify session is Pending
+    const [sessions] = await conn.query(
+      `SELECT table_id, session_status 
+       FROM dbo.QROrderSessions WITH (UPDLOCK)
+       WHERE qr_session_id = ?`,
+      [sessionId]
+    );
+
+    if (!sessions || sessions.length === 0) {
+      await conn.rollback();
+      transactionStarted = false;
+      return res.status(404).json({ success: false, message: "Session not found." });
+    }
+
+    if (sessions[0].session_status !== 'Pending') {
+      await conn.rollback();
+      transactionStarted = false;
+      return res.status(400).json({ success: false, message: "Session is not pending approval." });
+    }
+
+    const tableId = sessions[0].table_id;
+
+    // 2. Update Table to Occupied
+    await conn.query(
+      `UPDATE dbo.RestaurantTables 
+       SET table_status = N'Occupied', updated_at = SYSDATETIME() 
+       WHERE table_id = ?`,
+      [tableId]
+    );
+
+    // 3. Update Session to Active
+    await conn.query(
+      `UPDATE dbo.QROrderSessions 
+       SET session_status = N'Active' 
+       WHERE qr_session_id = ?`,
+      [sessionId]
+    );
+
+    await conn.commit();
+    transactionCommitted = true;
+    transactionStarted = false;
+
+    // 4. Emit to Customer & Staff
+    try {
+      const io = req.app?.get?.("io");
+      if (io) {
+        const payload = { session_id: sessionId, qr_session_id: sessionId, table_id: tableId };
+        io.emit("QR_SESSION_APPROVED", payload);
+        io.to(`session_${sessionId}`).emit("SESSION_APPROVED", payload);
+        io.to(`session_${sessionId}`).emit("QR_SESSION_APPROVED", payload);
+        io.to("room:manager").to("room:staff").emit("table:sync", { action: "update", table_id: tableId });
+      } else {
+        console.warn("[QR APPROVE] Socket.IO instance not found; DB update already committed.", { sessionId, tableId });
+      }
+    } catch (socketError) {
+      console.error("[QR APPROVE] Socket emit failed after commit:", socketError);
+    }
+
+    return res.json({ success: true, message: "Session approved." });
+  } catch (error) {
+    if (conn && transactionStarted && !transactionCommitted) {
+      try {
+        await conn.rollback();
+      } catch (rollbackError) {
+        console.error("[QR APPROVE] Rollback failed:", rollbackError);
+      }
+    }
+    console.error("🔥 BACKEND CRASH IN APPROVE API:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Internal server error",
+      error: error.message,
+    });
+  } finally {
+    conn?.release?.();
+  }
+}
+
+/**
+ * PATCH /api/sessions/:id/reject
+ * Staff/Manager rejects a pending QR session.
+ * Updates session to Closed, and emits Socket.IO event.
+ */
+export async function rejectQrSession(req, res) {
+  let conn;
+  let transactionStarted = false;
+  let transactionCommitted = false;
+
+  try {
+    conn = await pool.getConnection();
+    const sessionId = Number(req.params.id);
+    if (!Number.isFinite(sessionId) || sessionId <= 0) {
+      return res.status(400).json({ success: false, message: "Invalid session ID." });
+    }
+
+    await conn.beginTransaction();
+    transactionStarted = true;
+
+    const [sessions] = await conn.query(
+      `SELECT table_id, session_status 
+       FROM dbo.QROrderSessions WITH (UPDLOCK)
+       WHERE qr_session_id = ?`,
+      [sessionId]
+    );
+
+    if (!sessions || sessions.length === 0) {
+      await conn.rollback();
+      transactionStarted = false;
+      return res.status(404).json({ success: false, message: "Session not found." });
+    }
+
+    if (sessions[0].session_status !== 'Pending') {
+      await conn.rollback();
+      transactionStarted = false;
+      return res.status(400).json({ success: false, message: "Session is not pending approval." });
+    }
+
+    const tableId = sessions[0].table_id;
+
+    await conn.query(
+      `UPDATE dbo.QROrderSessions 
+       SET session_status = N'Closed', expires_at = SYSDATETIME()
+       WHERE qr_session_id = ?`,
+      [sessionId]
+    );
+
+    await conn.commit();
+    transactionCommitted = true;
+    transactionStarted = false;
+
+    try {
+      const io = req.app?.get?.("io");
+      if (io) {
+        const payload = { session_id: sessionId, qr_session_id: sessionId, table_id: tableId };
+        io.emit("QR_SESSION_REJECTED", payload);
+        io.to(`session_${sessionId}`).emit("SESSION_REJECTED", payload);
+        io.to(`session_${sessionId}`).emit("QR_SESSION_REJECTED", payload);
+        io.to("room:manager").to("room:staff").emit("table:sync", { action: "update", table_id: tableId });
+      } else {
+        console.warn("[QR REJECT] Socket.IO instance not found; DB update already committed.", { sessionId, tableId });
+      }
+    } catch (socketError) {
+      console.error("[QR REJECT] Socket emit failed after commit:", socketError);
+    }
+
+    return res.json({ success: true, message: "Session rejected." });
+  } catch (error) {
+    if (conn && transactionStarted && !transactionCommitted) {
+      try {
+        await conn.rollback();
+      } catch (rollbackError) {
+        console.error("[QR REJECT] Rollback failed:", rollbackError);
+      }
+    }
+    console.error("🔥 BACKEND CRASH IN REJECT API:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Internal server error",
+      error: error.message,
+    });
+  } finally {
+    conn?.release?.();
+  }
+}
+
+/**
+ * POST /api/public/qr-order/submit
+ * Public endpoint for QR Dine-in Guests.
+ */
+export async function submitQrOrderPublic(req, res) {
+  const conn = await pool.getConnection();
+  try {
+    const { sessionId, cartItems } = req.body;
+
+    if (!sessionId || !cartItems || !cartItems.length) {
+      return res.status(400).json({ success: false, message: "Invalid session or empty cart." });
+    }
+
+    await conn.beginTransaction();
+
+    // 1. Verify session is Active
+    const [sessions] = await conn.query(
+      `SELECT qs.table_id, qs.reservation_id, qs.customer_id, qs.session_status, t.table_number, t.table_status, a.area_name,
+              r.reservation_status, r.reservation_start_at, r.reservation_end_at,
+              CASE WHEN qs.reservation_id IS NULL THEN 1
+                   WHEN r.reservation_id IS NOT NULL
+                    AND r.reservation_status IN (N'Check-in', N'Dining')
+                    AND SYSDATETIME() >= DATEADD(minute, -30, r.reservation_start_at)
+                    AND SYSDATETIME() <= DATEADD(hour, 3, r.reservation_end_at)
+                    AND EXISTS (
+                      SELECT 1 FROM dbo.ReservationTables rt
+                      WHERE rt.reservation_id = qs.reservation_id
+                        AND rt.table_id = qs.table_id
+                    ) THEN 1
+                   ELSE 0 END AS reservation_is_current
+       FROM dbo.QROrderSessions qs WITH (UPDLOCK)
+       JOIN dbo.RestaurantTables t ON qs.table_id = t.table_id
+       LEFT JOIN dbo.RestaurantAreas a ON a.area_id = t.area_id
+       LEFT JOIN dbo.Reservations r ON r.reservation_id = qs.reservation_id
+       WHERE qs.qr_session_id = ?`,
+      [sessionId]
+    );
+
+    if (!sessions || sessions.length === 0 || sessions[0].session_status !== 'Active') {
+      await conn.rollback();
+      return res.status(403).json({ success: false, message: "Unauthorized QR Session." });
+    }
+    if (!sessions[0].reservation_is_current) {
+      await conn.rollback();
+      return res.status(409).json({
+        success: false,
+        message: "This QR session is no longer linked to the current reservation. Please ask staff to refresh the table session.",
+      });
+    }
+    if (isOmakaseAreaName(sessions[0].area_name) && sessions[0].table_status !== 'Occupied') {
+      await conn.rollback();
+      return res.status(409).json({
+        success: false,
+        message: "Omakase counter ordering is available after staff checks in the table.",
+      });
+    }
+    const tableId = sessions[0].table_id;
+    const tableName = sessions[0].table_number;
+    const reservationId = sessions[0].reservation_id ?? null;
+    const customerId = sessions[0].customer_id ?? null;
+
+    // Omakase seating policy (read-only lookups on the shared pool, before any write).
+    try {
+      await assertItemsAllowedForTables([tableId], cartItems, undefined, { allowOmakaseSet: true });
+    } catch (policyError) {
+      await conn.rollback();
+      if (policyError instanceof PolicyError) return sendPolicyError(res, policyError);
+      throw policyError;
+    }
+
+    // 2. An open order belongs to a QR session, not merely to a physical table.
+    // This prevents a later guest at the same table from appending to an old bill.
+    const [openOrders] = await conn.query(
+      `SELECT order_id 
+       FROM dbo.Orders WITH (UPDLOCK)
+       WHERE qr_session_id = ? AND order_status = N'Open'`,
+      [sessionId]
+    );
+
+    let orderId;
+    if (openOrders && openOrders.length > 0) {
+      orderId = openOrders[0].order_id;
+    } else {
+      // 3. Create a new Order
+      const insertOrder = await conn.query(
+        `INSERT INTO dbo.Orders (reservation_id, table_id, customer_id, qr_session_id, order_type, order_status, created_at, subtotal, total_amount)
+         OUTPUT INSERTED.order_id
+         VALUES (?, ?, ?, ?, N'QR Self', N'Open', SYSDATETIME(), 0, 0)`,
+        [reservationId, tableId, customerId, sessionId]
+      );
+      orderId = insertOrder[0][0].order_id;
+    }
+
+    // 4. Insert Items
+    for (const item of cartItems) {
+      const dishId = item.menu_item_id || item.dish_id || item.id;
+      // Get price to prevent spoofing
+      const [dishes] = await conn.query(`SELECT price FROM dbo.Dishes WHERE dish_id = ?`, [dishId]);
+      const price = dishes[0]?.price || 0;
+
+      const insertItem = await conn.query(
+        `INSERT INTO dbo.OrderItems (order_id, dish_id, quantity, unit_price, notes, item_status)
+         OUTPUT INSERTED.order_item_id
+         VALUES (?, ?, ?, ?, ?, N'Pending')`,
+        [orderId, dishId, item.quantity, price, item.notes || null]
+      );
+
+      const orderItemId = insertItem[0][0].order_item_id;
+
+      // Automatically create Kitchen Ticket
+      await conn.query(
+        `INSERT INTO dbo.KitchenTickets (order_item_id, kitchen_status, priority_level, sent_at)
+         VALUES (?, N'Pending', 3, SYSDATETIME())`,
+        [orderItemId]
+      );
+    }
+
+    // 5. Recalculate Order Total with Strict Accounting Math
+    await conn.query(
+      `UPDATE dbo.Orders 
+       SET subtotal = (SELECT ISNULL(SUM(quantity * unit_price), 0) FROM dbo.OrderItems WHERE order_id = ?),
+           total_amount = (SELECT ISNULL(SUM(quantity * unit_price), 0) FROM dbo.OrderItems WHERE order_id = ?) - ISNULL(discount_amount, 0) + ISNULL(service_charge, 0)
+       WHERE order_id = ?`,
+      [orderId, orderId, orderId]
+    );
+
+    await conn.commit();
+
+    // 6. Socket emit to staff & kitchen
+    const io = req.app.get("io");
+    if (io) {
+      io.to("room:manager").to("room:staff").emit("NEW_DINEIN_ORDER", { tableId, tableName, items: cartItems });
+      io.to("room:kitchen").emit("kds:new_ticket", { orderId, tableId, items: cartItems });
+    }
+
+    return res.json({ success: true, message: "Order sent to kitchen!", order_id: orderId });
+  } catch (error) {
+    await conn.rollback();
+    console.error("submitQrOrderPublic failed:", error);
+    return res.status(500).json({ success: false, message: "Failed to submit order." });
+  } finally {
+    conn.release();
+  }
+}
+
+/**
+ * GET /api/public/qr/session/:token/history
+ * Fetch history of orders for a given QR session token, categorized into preorders and session orders.
+ */
+export async function getQrSessionHistory(req, res) {
+  // Fetch history of orders for a given QR session token
+  try {
+
+    const { token } = req.params;
+    if (!token) return res.status(400).json({ success: false, message: "Token is required" });
+
+    // 1. Get session details
+    const [sessions] = await pool.query(
+      `SELECT qr_session_id, reservation_id, table_id
+       FROM dbo.QROrderSessions 
+       WHERE token = ?`,
+      [token]
+    );
+
+    if (!sessions || sessions.length === 0) {
+      return res.status(404).json({ success: false, message: "Session not found." });
+    }
+
+    const sessionObj = sessions[0] || {};
+    const safeResId = sessionObj.reservation_id ?? null;
+    const safeSessionId = sessionObj.qr_session_id ?? null;
+    // 2. Query all relevant Orders for this session/table/reservation
+    const [orders] = await pool.query(
+      `SELECT order_id, order_type, subtotal, discount_amount, service_charge, total_amount, amount_paid
+       FROM dbo.Orders
+       WHERE (reservation_id = ? AND reservation_id IS NOT NULL) 
+          OR (qr_session_id = ? AND qr_session_id IS NOT NULL)`,
+      [safeResId, safeSessionId]
+    );
+
+
+
+    let globalSubtotal = 0;
+    let globalPrepaid = 0;
+    let globalTotal = 0;
+    let serviceCharge = 0;
+    let discountAmount = 0;
+    // Preorders are authoritative in PreorderItems. Some legacy reservations
+    // have a Preorder order header but no OrderItems, so reading only Orders
+    // makes the customer's preorder disappear from history.
+    let preorders = [];
+    let sessionOrders = [];
+
+    if (safeResId) {
+      const [preorderRows] = await pool.query(
+        `SELECT pi.preorder_item_id AS order_item_id, pi.reservation_id, pi.quantity,
+                pi.unit_price, pi.notes, N'Preordered' AS item_status,
+                d.dish_name, CONCAT('/api/dishes/', d.dish_id, '/image') AS image_url,
+                N'Preorder' AS order_type
+         FROM dbo.PreorderItems pi
+         JOIN dbo.Dishes d ON d.dish_id = pi.dish_id
+         WHERE pi.reservation_id = ?`,
+        [safeResId]
+      );
+      preorders = preorderRows;
+    }
+
+    // To prevent duplicate items if orders overlap unexpectedly
+    const seenOrderIds = new Set();
+
+    for (const order of orders) {
+      if (seenOrderIds.has(order.order_id)) continue;
+      seenOrderIds.add(order.order_id);
+
+      globalSubtotal += Number(order.subtotal || 0);
+      globalTotal += Number(order.total_amount || 0);
+      serviceCharge += Number(order.service_charge || 0);
+      discountAmount += Number(order.discount_amount || 0);
+      globalPrepaid += Number(order.amount_paid || 0); // Pre-paid deposit is stored here
+
+      const [items] = await pool.query(`
+        SELECT 
+          oi.order_item_id, oi.order_id, oi.quantity, oi.unit_price, oi.item_status, oi.notes, oi.line_total,
+          d.dish_name, CONCAT('/api/dishes/', d.dish_id, '/image') AS image_url, o.order_type
+        FROM dbo.OrderItems oi
+        JOIN dbo.Dishes d ON oi.dish_id = d.dish_id
+        JOIN dbo.Orders o ON oi.order_id = o.order_id
+        WHERE oi.order_id = ? AND oi.item_status != N'Cancelled'
+      `, [order.order_id]);
+
+
+      if (order.order_type !== 'Preorder') {
+        sessionOrders = sessionOrders.concat(items);
+      }
+    }
+
+    res.json({
+      success: true,
+      data: {
+        preorders,
+        sessionOrders,
+        summary: {
+          subtotal: globalSubtotal,
+          serviceCharge,
+          discountAmount,
+          prepaidDeposit: globalPrepaid,
+          remainingToPay: Math.max(0, globalTotal - globalPrepaid)
+        }
+      }
+    });
+  } catch (error) {
+    console.error("getQrSessionHistory failed:", error);
+    res.status(500).json({ success: false, message: "Internal server error" });
+  }
+}
+
+/**
+ * DELETE /api/public/qr-order/items/:itemId
+ * Cancel a pending order item and strictly recalculate the invoice totals.
+ */
+export async function cancelOrderItem(req, res) {
+  const conn = await pool.getConnection();
+  try {
+    const itemId = Number(req.params.itemId);
+    if (!Number.isFinite(itemId)) return res.status(400).json({ success: false, message: "Invalid item ID" });
+
+    await conn.beginTransaction();
+
+    // 1. Lock and fetch the item
+    const [items] = await conn.query(
+      `SELECT oi.order_id, oi.item_status, oi.quantity, oi.unit_price, o.table_id
+       FROM dbo.OrderItems oi WITH (UPDLOCK)
+       JOIN dbo.Orders o ON oi.order_id = o.order_id
+       WHERE oi.order_item_id = ?`,
+      [itemId]
+    );
+
+    if (!items || items.length === 0) {
+      await conn.rollback();
+      return res.status(404).json({ success: false, message: "Item not found" });
+    }
+
+    const item = items[0];
+
+    // 2. Strict status check (allow cancellation if not yet Preparing or beyond)
+    if (item.item_status !== 'Pending' && item.item_status !== 'Sent To Kitchen') {
+      await conn.rollback();
+      return res.status(400).json({ success: false, message: `Cannot cancel item. Kitchen has already started preparing it (Status: ${item.item_status})` });
+    }
+
+    // 3. Update Item Status
+    await conn.query(
+      `UPDATE dbo.OrderItems SET item_status = N'Cancelled' WHERE order_item_id = ?`,
+      [itemId]
+    );
+
+    // 4. Delete or Cancel Kitchen Ticket
+    await conn.query(
+      `UPDATE dbo.KitchenTickets SET kitchen_status = N'Cancelled' WHERE order_item_id = ?`,
+      [itemId]
+    );
+
+    // 5. Strict Recalculation of Order Totals
+    // Sum only non-cancelled items
+    await conn.query(
+      `UPDATE dbo.Orders 
+       SET subtotal = ISNULL((SELECT SUM(quantity * unit_price) FROM dbo.OrderItems WHERE order_id = ? AND item_status != N'Cancelled'), 0)
+       WHERE order_id = ?`,
+      [item.order_id, item.order_id]
+    );
+
+    await conn.query(
+      `UPDATE dbo.Orders
+       SET total_amount = subtotal - ISNULL(discount_amount, 0) + ISNULL(service_charge, 0)
+       WHERE order_id = ?`,
+      [item.order_id]
+    );
+
+    await conn.commit();
+
+    // 6. Real-time updates
+    const io = req.app.get("io");
+    if (io) {
+      io.to("room:kitchen").emit("kds:ticket_cancelled", { orderItemId: itemId });
+      // Notify staff
+      io.to("room:manager").to("room:staff").emit("ORDER_ITEM_CANCELLED", { orderId: item.order_id, itemId });
+    }
+
+    return res.json({ success: true, message: "Item cancelled successfully." });
+  } catch (error) {
+    await conn.rollback();
+    console.error("cancelOrderItem failed:", error);
+    return res.status(500).json({ success: false, message: "Failed to cancel item." });
+  } finally {
+    conn.release();
+  }
+}
+
+/**
+ * PATCH /api/public/qr-order/items/:itemId/quantity
+ * Update quantity of a pending/sent order item and recalculate totals.
+ */
+export async function updateOrderItemQuantity(req, res) {
+  const conn = await pool.getConnection();
+  try {
+    const itemId = Number(req.params.itemId);
+    const { quantity } = req.body;
+    if (!Number.isFinite(itemId) || typeof quantity !== 'number' || quantity < 1) {
+      return res.status(400).json({ success: false, message: "Invalid item ID or quantity" });
+    }
+
+    await conn.beginTransaction();
+
+    // 1. Lock and fetch the item
+    const [items] = await conn.query(
+      `SELECT oi.order_id, oi.item_status, oi.quantity, oi.unit_price, o.table_id
+       FROM dbo.OrderItems oi WITH (UPDLOCK)
+       JOIN dbo.Orders o ON oi.order_id = o.order_id
+       WHERE oi.order_item_id = ?`,
+      [itemId]
+    );
+
+    if (!items || items.length === 0) {
+      await conn.rollback();
+      return res.status(404).json({ success: false, message: "Item not found" });
+    }
+
+    const item = items[0];
+
+    // 2. Strict status check (allow update if not yet Preparing or beyond)
+    if (item.item_status !== 'Pending' && item.item_status !== 'Sent To Kitchen') {
+      await conn.rollback();
+      return res.status(400).json({ success: false, message: `Cannot update item. Kitchen has already started preparing it (Status: ${item.item_status})` });
+    }
+
+    // 3. Update Item Quantity
+    await conn.query(
+      `UPDATE dbo.OrderItems SET quantity = ? WHERE order_item_id = ?`,
+      [quantity, itemId]
+    );
+
+    // 4. Strict Recalculation of Order Totals
+    await conn.query(
+      `UPDATE dbo.Orders 
+       SET subtotal = ISNULL((SELECT SUM(quantity * unit_price) FROM dbo.OrderItems WHERE order_id = ? AND item_status != N'Cancelled'), 0)
+       WHERE order_id = ?`,
+      [item.order_id, item.order_id]
+    );
+
+    await conn.query(
+      `UPDATE dbo.Orders
+       SET total_amount = subtotal - ISNULL(discount_amount, 0) + ISNULL(service_charge, 0)
+       WHERE order_id = ?`,
+      [item.order_id]
+    );
+
+    await conn.commit();
+
+    // 5. Real-time updates
+    const io = req.app.get("io");
+    if (io) {
+      // Tell KDS UI to reload the queue so it sees the new quantity
+      io.to("room:kitchen").emit("kds:ticket_updated", { orderItemId: itemId, status: item.item_status });
+      // Tell staff UI
+      io.to("room:manager").to("room:staff").emit("ORDER_ITEM_UPDATED", { orderId: item.order_id, itemId });
+    }
+
+    return res.json({ success: true, message: "Item quantity updated successfully." });
+  } catch (error) {
+    await conn.rollback();
+    console.error("updateOrderItemQuantity failed:", error);
+    return res.status(500).json({ success: false, message: "Failed to update item quantity." });
+  } finally {
+    conn.release();
+  }
+}
+
+export async function applyPromoCodeToQrSession(req, res) {
+  const { token } = req.params;
+  const { promo_code } = req.body || {};
+  if (!token || !promo_code) {
+    return res.status(400).json({ success: false, message: "Token and promo_code are required." });
+  }
+
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+
+    // 1. Validate session and get order_id
+    const [sessions] = await conn.query(
+      `SELECT qr_session_id FROM dbo.QROrderSessions WITH (UPDLOCK) WHERE token=? AND session_status=N'Active' AND (expires_at IS NULL OR expires_at>SYSDATETIME())`,
+      [token]
+    );
+    if (!sessions.length) {
+      await conn.rollback();
+      return res.status(404).json({ success: false, message: "Invalid or expired session." });
+    }
+    const [orders] = await conn.query(
+      `SELECT TOP 2 order_id, subtotal, discount_amount, applied_promo_code
+       FROM dbo.Orders WITH (UPDLOCK,HOLDLOCK)
+       WHERE qr_session_id=? AND order_status NOT IN (N'Paid',N'Cancelled')
+       AND (? IS NULL OR order_id=TRY_CONVERT(int,?)) ORDER BY order_id DESC`,
+      [sessions[0].qr_session_id, req.body.order_id ?? null, req.body.order_id ?? null]
+    );
+    if (orders.length > 1) {
+      await conn.rollback();
+      return res.status(409).json({success:false,message:"Select the order to apply the promotion."});
+    }
+    if (orders.length === 0) {
+      await conn.rollback();
+      return res.status(404).json({ success: false, message: "Order not found." });
+    }
+    const order = orders[0];
+    if (order.discount_amount > 0 || order.applied_promo_code) {
+      await conn.rollback();
+      return res.status(400).json({ success: false, message: "A promo code has already been applied to this order." });
+    }
+
+    // 3. Validate PromoCode & Promotion
+    const [promoCodes] = await conn.query(
+      `SELECT v.promo_code_id, v.promo_code, v.usage_limit, v.times_used, 
+              p.promotion_id, p.discount_type, p.discount_value, p.max_discount, 
+              p.min_order_value, p.start_at, p.end_at, p.applicable_to
+       FROM dbo.PromoCodes v WITH (UPDLOCK,HOLDLOCK)
+       JOIN dbo.Promotions p ON v.promotion_id = p.promotion_id
+       WHERE v.promo_code = ? AND v.is_active = 1 AND p.is_active = 1
+         AND SYSDATETIME() BETWEEN p.start_at AND p.end_at`,
+      [promo_code]
+    );
+
+    if (promoCodes.length === 0) {
+      await conn.rollback();
+      return res.status(400).json({ success: false, message: "Invalid or inactive promo code." });
+    }
+
+    const promo = promoCodes[0];
+    if (promo.usage_limit && promo.times_used >= promo.usage_limit) {
+      await conn.rollback();
+      return res.status(400).json({ success: false, message: "Promo code usage limit reached." });
+    }
+    if (promo.applicable_to === 'Reservation') {
+      await conn.rollback();
+      return res.status(400).json({ success: false, message: "This promo code is only applicable to reservations." });
+    }
+    if (order.subtotal < promo.min_order_value) {
+      await conn.rollback();
+      return res.status(400).json({ success: false, message: `Minimum order value of ${promo.min_order_value} required.` });
+    }
+
+    // 4. Calculate discount
+    let discountAmount = 0;
+    if (promo.discount_type.toUpperCase() === 'PERCENT') {
+      discountAmount = order.subtotal * (promo.discount_value / 100);
+      if (promo.max_discount && discountAmount > promo.max_discount) {
+        discountAmount = promo.max_discount;
+      }
+    } else {
+      discountAmount = promo.discount_value;
+    }
+    // Prevent negative total
+    if (discountAmount > order.subtotal) {
+      discountAmount = order.subtotal;
+    }
+
+    // 5. Update Order with discount
+    // We also recalculate total_amount: subtotal - discount + service_charge (if any, assuming 0 for now or keeping existing calculation)
+    await conn.query(
+      `UPDATE dbo.Orders 
+       SET discount_amount = ?,
+        total_amount = subtotal - ? + ISNULL(service_charge, 0),
+        applied_promo_code = ?
+          WHERE order_id = ? `,
+      [discountAmount, discountAmount, promo_code, order.order_id]
+    );
+
+    // 6. [CRITICAL FIX] Deduct Quota (times_used) atomically
+    await conn.query(
+      `UPDATE dbo.PromoCodes SET times_used = times_used + 1 WHERE promo_code = ? `,
+      [promo_code]
+    );
+
+    // Also update order details to return
+    const [updatedOrders] = await conn.query(
+      `SELECT total_amount FROM dbo.Orders WHERE order_id = ? `,
+      [order.order_id]
+    );
+
+    await conn.commit();
+
+    return res.json({ 
+      success: true, 
+      message: "Promo code applied successfully.", 
+      discount_amount: discountAmount,
+      new_total: updatedOrders[0].total_amount
+    });
+
+  } catch (error) {
+    await conn.rollback();
+    console.error("applyPromoCodeToQrSession error:", error);
+    return res.status(500).json({ success: false, message: "Server error applying promo code." });
+  } finally {
+    conn.release();
+  }
+}
