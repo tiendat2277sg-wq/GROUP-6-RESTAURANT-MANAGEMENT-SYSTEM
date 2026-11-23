@@ -1,0 +1,2010 @@
+import { paymentQrUrl } from '../../../shared/bankTransfer.js';
+import express from "express";
+
+import pool from "../db.js";
+import { assertItemsAllowedForTables, assertItemsAllowedForReservation, assertSameSeatingKind, tableIdsOfReservation, PolicyError, sendPolicyError } from "../utils/areaDishPolicy.js";
+import { resolveUserId, requireUserId } from "../middleware/authMiddleware.js";
+
+import {
+  getKitchenViewPlaceholderTableId,
+  getKitchenViewSeatsBooked,
+  isKitchenViewAreaName,
+  KITCHEN_VIEW_AREA_NAME,
+  resolveKitchenViewCounterCapacity,
+} from "../utils/kitchenViewBooking.js";
+import { notifyStaffNewCustomerAction } from "../services/notificationService.js";
+import { getIO } from "../socket.js";
+import { sendBookingConfirmationEmail } from "../email.js";
+import { RESERVATION_STATUS } from "../constants/reservationStatus.js"; // backend-local copy — do NOT import from frontend/ (breaks Docker)
+import { updateReservationStatus } from "../services/reservationStateService.js";
+import { submitEditRequest, submitCancelRequest } from "../services/reservationRequestService.js";
+import {
+  createPreSaveReservation,
+  cancelPendingPayment,
+  applyPromoCodeToReservation,
+  submitReservationReview
+} from "../controllers/customerReservationController.js";
+import { getUpgradeQuote, verifyUpgradePayment } from "../controllers/upgradePaymentController.js";
+import { validateReservationCreate, validateReservationUpdate } from "../middleware/validateReservation.js";
+import { sweepNoShows } from "../services/noShowSweeper.js";
+import { getReservationTimeline } from "../utils/timelineLogger.js";
+import {
+  appendPreferredTableTags,
+  CONFIRMED_ASSIGNMENT_WINDOW_HOURS,
+  getAssignmentMode,
+  parsePreferredTableTags,
+  TABLE_ASSIGNMENT_STATUS,
+} from "../utils/tableAssignmentPolicy.js";
+
+const router = express.Router();
+
+/* ------------------------------------------------------------------ */
+/* POST /api/reservations/:id/review                                   */
+/* ------------------------------------------------------------------ */
+router.post("/:id/review", resolveUserId, requireUserId, submitReservationReview);
+
+// Omakase seatings are fixed: 2.5 hours per guest, no custom duration.
+const OMAKASE_SEATING_MINUTES = 150;
+
+/* ------------------------------------------------------------------ */
+/* POST /api/reservations/pre-save                                     */
+/* ------------------------------------------------------------------ */
+router.post("/pre-save", resolveUserId, validateReservationCreate, createPreSaveReservation);
+
+/* ------------------------------------------------------------------ */
+/* PATCH /api/reservations/:id/abort-payment                            */
+/* ------------------------------------------------------------------ */
+router.patch("/:id/abort-payment", resolveUserId, cancelPendingPayment);
+
+/* ------------------------------------------------------------------ */
+/* GET /api/reservations/:id/timeline                                   */
+/* ------------------------------------------------------------------ */
+router.get("/:id/timeline", resolveUserId, requireUserId, getReservationTimeline);
+
+/* ------------------------------------------------------------------ */
+/* PATCH /api/reservations/:id/apply-promo                            */
+/* ------------------------------------------------------------------ */
+router.patch("/:id/apply-promo", resolveUserId, requireUserId, applyPromoCodeToReservation);
+
+/* ------------------------------------------------------------------ */
+/* Display mapping (presentation only — DB keeps real area/table data) */
+/* ------------------------------------------------------------------ */
+
+// Maps a DB table_number -> premium UI label + floor/zone hints.
+const TABLE_DISPLAY = {
+  T01: { displayLabel: "101", floor: 1, zone: "Main Dining" },
+  T02: { displayLabel: "102", floor: 1, zone: "Main Dining" },
+  T03: { displayLabel: "103", floor: 1, zone: "Main Dining" },
+  T04: { displayLabel: "104", floor: 1, zone: "Main Dining" },
+  V01: { displayLabel: "VIP-101", floor: 1, zone: "VIP Lounge" },
+  V02: { displayLabel: "VIP-102", floor: 1, zone: "VIP Lounge" },
+  B01: { displayLabel: "BAR-101", floor: 1, zone: "Window / Bar" },
+  P01: { displayLabel: "PR-101", floor: 1, zone: "Private Room" },
+  G01: { displayLabel: "201", floor: 2, zone: "Rooftop Terrace" },
+  G02: { displayLabel: "202", floor: 2, zone: "Rooftop Terrace" },
+};
+
+function decorateTable(row) {
+  const meta = TABLE_DISPLAY[row.table_number] || {
+    displayLabel: row.table_number,
+    floor: 1,
+    zone: row.area_name,
+  };
+
+  return { ...meta };
+}
+
+/* ------------------------------------------------------------------ */
+/* Settings helpers                                                    */
+/* ------------------------------------------------------------------ */
+
+const SETTING_KEYS = [
+  "open_time",
+  "close_time",
+  "max_guests",
+  "table_hold_min",
+  "cancel_deadline_h",
+  "restaurant_name",
+  "restaurant_address",
+  "restaurant_phone",
+  "restaurant_email",
+  "hours_mon_thu",
+  "hours_fri_sat",
+  "hours_sunday",
+  "hours_happy",
+  "closed_days",
+];
+
+async function loadSettings() {
+  const placeholders = SETTING_KEYS.map(() => "?").join(", ");
+
+  const [rows] = await pool.query(
+    `SELECT setting_key, setting_value
+     FROM dbo.RestaurantSettings
+     WHERE setting_key IN (${placeholders})`,
+    SETTING_KEYS
+  );
+
+  const map = {};
+
+  for (const row of rows) {
+    map[row.setting_key] = row.setting_value;
+  }
+
+  return {
+    // Lunch service starts at 10:00 (break 15:00-17:00, dinner 17:00-22:00).
+    open_time: map.open_time || "10:00",
+    close_time: map.close_time || "22:00",
+    max_guests: Number(map.max_guests) || 12,
+    table_hold_min: Number(map.table_hold_min) || 15,
+    cancel_deadline_h: Number(map.cancel_deadline_h) || 2,
+    restaurant_name: map.restaurant_name || "FUKU",
+    restaurant_address: map.restaurant_address || "",
+    restaurant_phone: map.restaurant_phone || "",
+    restaurant_email: map.restaurant_email || "",
+    hours_mon_thu: map.hours_mon_thu || "7:00 AM — 12:00 AM",
+    hours_fri_sat: map.hours_fri_sat || "7:00 AM — 12:00 AM",
+    hours_sunday: map.hours_sunday || "7:00 PM — 10:00 PM",
+    hours_happy: map.hours_happy || "4:00 PM — 7:00 PM Daily",
+    closed_days: map.closed_days || "",
+  };
+}
+
+/* ------------------------------------------------------------------ */
+/* Date / time helpers                                                 */
+/* ------------------------------------------------------------------ */
+
+// Build a local Date from "YYYY-MM-DD" + "HH:mm".
+function buildLocalDate(dateStr, timeStr) {
+  if (!dateStr || !timeStr) return null;
+
+  const [y, m, d] = String(dateStr).split("-").map(Number);
+  const [hh, mm] = String(timeStr).split(":").map(Number);
+
+  if ([y, m, d, hh, mm].some((n) => !Number.isFinite(n))) return null;
+
+  return new Date(y, m - 1, d, hh, mm, 0, 0);
+}
+
+function timeToMinutes(timeStr) {
+  const [hh, mm] = String(timeStr).split(":").map(Number);
+
+  if (!Number.isFinite(hh) || !Number.isFinite(mm)) return null;
+
+  return hh * 60 + mm;
+}
+
+function formatLocalIso(date) {
+  if (!(date instanceof Date) || Number.isNaN(date.getTime())) return null;
+
+  const pad = (n) => String(n).padStart(2, "0");
+
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(
+    date.getDate()
+  )}T${pad(date.getHours())}:${pad(date.getMinutes())}:00`;
+}
+
+const UNAVAILABLE_REASON = {
+  Reserved: "Already booked",
+  Occupied: "Currently occupied",
+  Cleaning: "Being cleaned",
+  Inactive: "Not in service",
+  Booked: "Already booked for this time",
+};
+
+const ACTIVE_RESERVATION_STATUS_SQL = `
+  N'Pending Request',
+  N'Awaiting Deposit',
+  N'Await Check-in',
+  N'Reserved',
+  N'Confirmed',
+  N'Paid',
+  N'Check-in',
+  N'Dining',
+  N'Overdue'
+`;
+
+const MULTI_TABLE_PURPOSES = new Set([
+  "birthday", "business meeting", "family gathering", "special occasion", "private party",
+]);
+
+/* ------------------------------------------------------------------ */
+/* Suggestion logic                                                    */
+/* ------------------------------------------------------------------ */
+
+// Pick the best single table or combination for a guest count.
+function computeRecommendations(tables, guestCount) {
+  // Omakase counters are never auto-recommended: guests must choose that area deliberately.
+  const bookable = tables
+    .filter((t) => t.is_bookable && !/omakase/i.test(String(t.area_name || "")))
+    .sort((a, b) => a.capacity - b.capacity);
+
+  // 1) Smallest single table that fits.
+  const single = bookable.find((t) => t.capacity >= guestCount);
+
+  if (single) return [single.table_id];
+
+  // 2) Greedy combination (largest first) within the same floor when possible.
+  const byFloor = {};
+
+  for (const t of bookable) {
+    byFloor[t.floor] = byFloor[t.floor] || [];
+    byFloor[t.floor].push(t);
+  }
+
+  for (const floor of Object.keys(byFloor)) {
+    const sorted = [...byFloor[floor]].sort((a, b) => b.capacity - a.capacity);
+    const picked = [];
+    let total = 0;
+
+    for (const t of sorted) {
+      picked.push(t.table_id);
+      total += t.capacity;
+
+      if (total >= guestCount) return picked;
+    }
+  }
+
+  return [];
+}
+
+/* ------------------------------------------------------------------ */
+/* Expire Old Holds                                                    */
+/* ------------------------------------------------------------------ */
+
+async function expireOldHolds() {
+  try {
+    const [rows] = await pool.query(`
+      SELECT reservation_id, reservation_start_at, special_request, reservation_status
+      FROM dbo.Reservations
+      WHERE reservation_status IN (N'Pending Request', N'Await Check-in', N'Awaiting Deposit')
+    `);
+
+    if (rows.length === 0) return;
+
+    const now = Date.now();
+    const toExpire = [];
+
+    for (const r of rows) {
+      const match = String(r.special_request || "").match(/\[Hold:\s*(\d+)m\]/);
+      const holdMins = match ? parseInt(match[1], 10) : 30;
+      const startMs = new Date(r.reservation_start_at).getTime();
+
+      if (now > startMs + holdMins * 60000) {
+        toExpire.push(r.reservation_id);
+      }
+    }
+
+    if (toExpire.length > 0) {
+      const placeholders = toExpire.map(() => "?").join(",");
+
+      // 1) Release tables assigned to the expired reservations
+      await pool.query(
+        `
+        UPDATE dbo.RestaurantTables
+        SET table_status = N'Available',
+            updated_at = SYSDATETIME()
+        WHERE table_id IN (
+            SELECT table_id
+            FROM dbo.ReservationTables
+            WHERE reservation_id IN (${placeholders})
+        )
+        `,
+        toExpire
+      );
+
+      // 2) Update reservation status to Cancelled to comply with CHECK constraint
+      for (const resId of toExpire) {
+        try {
+          await updateReservationStatus({
+            connection: pool,
+            reservationId: resId,
+            toStatus: RESERVATION_STATUS.CANCELLED,
+            staffId: null,
+            auditAction: "SYSTEM_HOLD_EXPIRED",
+            extraUpdates: ", cancel_reason = N'Hold expired', cancelled_at = SYSDATETIME()"
+          });
+        } catch (e) {
+          console.error("[expireOldHolds] Failed to update status for", resId, e.message);
+        }
+      }
+    }
+  } catch (err) {
+    console.error("Failed to expire old holds:", err);
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* GET /api/reservations/settings                                      */
+/* ------------------------------------------------------------------ */
+
+router.get("/settings", async (_req, res) => {
+  try {
+    const settings = await loadSettings();
+
+    return res.json({ success: true, settings });
+  } catch (error) {
+    console.error("Load reservation settings failed:", error);
+
+    return res.json({
+      success: true,
+      settings: {
+        open_time: "10:00",
+        close_time: "22:00",
+        max_guests: 12,
+        cancel_deadline_h: 2,
+      },
+    });
+  }
+});
+
+/* ------------------------------------------------------------------ */
+/* GET /api/reservations/menu                                          */
+/* ------------------------------------------------------------------ */
+
+router.get("/menu", async (_req, res) => {
+  try {
+    const [rows] = await pool.query(
+      `SELECT d.dish_id, d.dish_name, d.price, c.category_name, c.display_order, d.is_available
+       FROM dbo.Dishes d
+       JOIN dbo.MenuCategories c ON d.category_id = c.category_id
+       WHERE c.is_active = 1
+       ORDER BY c.display_order, d.dish_name;`
+    );
+
+    const dishes = rows.map((r) => ({
+      dish_id: r.dish_id,
+      dish_name: r.dish_name,
+      price: Number(r.price),
+      category_name: r.category_name,
+      is_available: r.is_available === true || r.is_available === 1 || r.is_available === '1',
+    }));
+
+    return res.json({ success: true, dishes });
+  } catch (error) {
+    console.error("Load preorder menu failed:", error);
+
+    return res.status(500).json({
+      success: false,
+      message: "Could not load the preorder menu.",
+    });
+  }
+});
+
+/* ------------------------------------------------------------------ */
+/* GET /api/reservations/availability                                  */
+/* ------------------------------------------------------------------ */
+
+router.get("/availability", async (req, res) => {
+  try {
+    await expireOldHolds();
+    await sweepNoShows().catch((err) => console.error("[availability] Auto sweep failed:", err.message));
+
+    const { date, time } = req.query;
+    const durationMinutes = Number(req.query.durationMinutes) || 120;
+    const guestCount = Number(req.query.guestCount) || 1;
+    const areaType = req.query.areaType || null;
+
+    const slotStart = buildLocalDate(date, time);
+
+    if (!slotStart) {
+      return res.status(400).json({
+        success: false,
+        message: "Valid date and time are required.",
+      });
+    }
+
+    const slotEnd = new Date(slotStart.getTime() + durationMinutes * 60000);
+    const settings = await loadSettings();
+    const bufferMinutes = Number(settings.table_hold_min) || 15;
+    const tableAssignmentStatus = getAssignmentMode(slotStart);
+
+    const [rows] = await pool.query(
+      `SELECT
+         t.table_id,
+         t.table_number,
+         t.capacity,
+         t.notes,
+         t.table_status AS current_status,
+         t.merged_into_table_id,
+         t.is_counter,
+         a.area_id,
+         a.area_name,
+         a.area_type,
+         (
+           SELECT TOP 1 tos.estimated_release_at
+           FROM dbo.TableOccupancySessions tos
+           WHERE tos.table_id = t.table_id
+             AND tos.released_at IS NULL
+           ORDER BY tos.check_in_at DESC
+         ) AS estimated_release_at,
+         CASE
+            WHEN t.table_status = N'Inactive' THEN N'Inactive'
+            WHEN EXISTS (
+              SELECT 1
+              FROM dbo.TableOccupancySessions tos
+              WHERE tos.table_id = t.table_id
+                AND tos.released_at IS NULL
+                AND tos.estimated_release_at > ?
+            ) THEN N'Occupied'
+            WHEN EXISTS (
+              SELECT 1
+              FROM dbo.Reservations r
+              LEFT JOIN dbo.ReservationTables rt ON rt.reservation_id = r.reservation_id
+              WHERE (
+                rt.table_id = t.table_id
+                OR r.special_request LIKE CONCAT('%[PreferredTableId: ', t.table_id, ']%')
+              )
+                AND r.reservation_status IN (${ACTIVE_RESERVATION_STATUS_SQL})
+                AND DATEADD(minute, -?, r.reservation_start_at) < CASE WHEN a.area_name LIKE N'%omakase%' THEN ? ELSE ? END
+                AND DATEADD(minute, ?, r.reservation_end_at) > ?
+            ) THEN N'Booked'
+            ELSE N'Available'
+          END AS availability_at_slot
+        FROM dbo.RestaurantTables t
+        JOIN dbo.RestaurantAreas a ON t.area_id = a.area_id
+        WHERE a.is_active = 1
+        ORDER BY a.area_type, t.table_number;`,
+      [slotStart, bufferMinutes, new Date(slotStart.getTime() + OMAKASE_SEATING_MINUTES * 60000), slotEnd, bufferMinutes, slotStart]
+    );
+
+    let tables = rows.map((row) => {
+      const meta = decorateTable(row);
+      const availability = row.availability_at_slot;
+      const isBookable = availability === "Available";
+      const isTooSmall = row.capacity < guestCount;
+
+      return {
+        table_id: row.table_id,
+        table_number: row.table_number,
+        display_label: meta.displayLabel,
+        floor: meta.floor,
+        zone: meta.zone,
+        area_id: row.area_id,
+        area_name: row.area_name,
+        area_type: row.area_type,
+        capacity: row.capacity,
+        merged_into_table_id: row.merged_into_table_id || null,
+        is_counter: Boolean(row.is_counter),
+        notes: row.notes || null,
+        current_status: row.current_status,
+        availability_at_slot: availability,
+        is_bookable: isBookable,
+        is_too_small: isTooSmall,
+        is_suggested: false,
+        estimated_release_at: row.estimated_release_at || null,
+        reason: isBookable
+          ? null
+          : UNAVAILABLE_REASON[availability] || "Unavailable",
+      };
+    });
+
+    if (areaType) {
+      const wanted = String(areaType).toLowerCase();
+
+      tables = tables.map((t) => ({
+        ...t,
+        matches_area: t.area_type.toLowerCase() === wanted,
+      }));
+    }
+
+    const recommendedTableIds = computeRecommendations(tables, guestCount);
+    const recommendedSet = new Set(recommendedTableIds);
+
+    tables = tables.map((t) => ({
+      ...t,
+      is_suggested: recommendedSet.has(t.table_id),
+    }));
+
+    return res.json({
+      success: true,
+      slotStart: formatLocalIso(slotStart),
+      slotEnd: formatLocalIso(slotEnd),
+      durationMinutes,
+      guestCount,
+      tableAssignmentMode: tableAssignmentStatus,
+      table_assignment_status: tableAssignmentStatus,
+      confirmedAssignmentWindowHours: CONFIRMED_ASSIGNMENT_WINDOW_HOURS,
+      assignmentMessage:
+        tableAssignmentStatus === TABLE_ASSIGNMENT_STATUS.CONFIRMED
+          ? "Selected tables are confirmed for this near-term booking window."
+          : "Selected tables are recorded as preferences. Staff confirms the final table closer to the visit.",
+      settings,
+      tables,
+      recommendedTableIds,
+    });
+  } catch (error) {
+    console.error("Reservation availability failed:", error);
+
+    return res.status(500).json({
+      success: false,
+      message: "Could not load table availability.",
+    });
+  }
+});
+
+/* ------------------------------------------------------------------ */
+/* GET /api/reservations/table-bookings                                */
+/* ------------------------------------------------------------------ */
+
+router.get("/table-bookings", async (req, res) => {
+  try {
+    const { tableId, date } = req.query;
+    if (!tableId || !date) {
+      return res.status(400).json({
+        success: false,
+        message: "tableId and date are required.",
+      });
+    }
+
+    const startOfDay = `${date} 00:00:00`;
+    const endOfDay = `${date} 23:59:59`;
+
+    const [rows] = await pool.query(
+      `SELECT r.reservation_start_at, r.reservation_end_at
+       FROM dbo.Reservations r
+       JOIN dbo.ReservationTables rt ON r.reservation_id = rt.reservation_id
+       WHERE rt.table_id = ?
+         AND r.reservation_status IN (N'Await Check-in', N'Dining')
+         AND r.reservation_start_at >= ?
+         AND r.reservation_start_at <= ?
+       ORDER BY r.reservation_start_at ASC;`,
+      [Number(tableId), startOfDay, endOfDay]
+    );
+
+    return res.json({
+      success: true,
+      bookings: rows.map(r => ({
+        start: r.reservation_start_at,
+        end: r.reservation_end_at
+      }))
+    });
+  } catch (error) {
+    console.error("GET /api/reservations/table-bookings failed:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Could not load table bookings.",
+    });
+  }
+});
+
+/* ------------------------------------------------------------------ */
+/* GET /api/reservations/status                                        */
+/* ------------------------------------------------------------------ */
+
+router.get("/status", async (req, res) => {
+  const { txn_ref } = req.query;
+  if (!txn_ref) {
+    return res.status(400).json({ success: false, message: "Missing txn_ref parameter." });
+  }
+
+  try {
+    const [rows] = await pool.query(
+      `SELECT reservation_id, reservation_status, vnp_txn_ref 
+       FROM dbo.Reservations 
+       WHERE vnp_txn_ref = ?`,
+      [txn_ref]
+    );
+
+    if (rows.length === 0) {
+      return res.status(404).json({ success: false, message: "Reservation not found for the given transaction reference." });
+    }
+
+    const { reservation_id, reservation_status } = rows[0];
+
+    // Map to public statuses
+    let publicStatus = "Pending";
+    if (reservation_status === RESERVATION_STATUS.CONFIRMED || reservation_status === RESERVATION_STATUS.PENDING_REQUEST) {
+      return res.redirect(`/payment/vnpay_return${req.url.substring(req.url.indexOf("?"))}`);
+    } else if (reservation_status === RESERVATION_STATUS.CANCELLED) {
+      publicStatus = "PaymentFailed";
+    }
+
+    return res.json({
+      success: true,
+      status: publicStatus,
+      reservation_id: reservation_id
+    });
+  } catch (error) {
+    console.error("Error fetching reservation status by txn_ref:", error);
+    return res.status(500).json({ success: false, message: "Internal server error." });
+  }
+});
+
+
+
+/* ------------------------------------------------------------------ */
+/* POST /api/reservations                                              */
+/* ------------------------------------------------------------------ */
+
+router.post("/", resolveUserId, validateReservationCreate, async (req, res) => {
+  const {
+    reservation_start_at,
+    reservation_end_at,
+    date,
+    time,
+    durationMinutes,
+    guest_count,
+    preferred_area_id,
+    table_ids,
+    // Accept both field name conventions from the frontend
+    contact_name,  contact_email,  contact_phone,
+    guest_name:    guestNameField,
+    guest_phone:   guestPhoneField,
+    guest_email:   guestEmailField,
+    special_request,
+    preorderItems,
+    preorder_items,
+    dining_purpose,
+    duration,
+  } = req.body || {};
+
+  // Normalise contact fields: prefer guest_* prefix (new), fall back to contact_* (legacy)
+  const guestNameRaw  = guestNameField  || contact_name  || null;
+  const guestPhoneRaw = guestPhoneField || contact_phone || null;
+  const guestEmailRaw = guestEmailField || contact_email || null;
+  // Support both camelCase and snake_case preorder field names
+  const preorderItemsRaw = req.body.preorder_items || req.body.pre_order_items || req.body.preorderItems || [];
+
+  console.log("POST /api/reservations body:", JSON.stringify(req.body, null, 2));
+  console.log("Parsed preorderItems:", preorderItemsRaw);
+  console.log("Parsed table_ids:", table_ids);
+  console.log("Parsed preferred_area_id:", preferred_area_id);
+  console.log("Parsed userId:", req.userId);
+
+  let slotStart = reservation_start_at
+    ? new Date(reservation_start_at)
+    : buildLocalDate(date, time);
+
+  let slotEnd = reservation_end_at
+    ? new Date(reservation_end_at)
+    : slotStart
+      ? new Date(slotStart.getTime() + (Number(durationMinutes) || 120) * 60000)
+      : null;
+
+  if (
+    !slotStart ||
+    Number.isNaN(slotStart.getTime()) ||
+    !slotEnd ||
+    Number.isNaN(slotEnd.getTime())
+  ) {
+    return res.status(400).json({
+      success: false,
+      message: "Invalid reservation date/time.",
+    });
+  }
+
+  if (slotEnd <= slotStart) {
+    return res.status(400).json({
+      success: false,
+      message: "End time must be after start time.",
+    });
+  }
+
+  if (slotStart.getTime() <= Date.now()) {
+    return res.status(400).json({
+      success: false,
+      message: "Reservation time must be in the future.",
+    });
+  }
+
+  const guestCount = Number(guest_count);
+
+  if (!Number.isFinite(guestCount) || guestCount < 1) {
+    return res.status(400).json({
+      success: false,
+      message: "Guest count must be at least 1.",
+    });
+  }
+
+  const tableIds = Array.isArray(table_ids)
+    ? [...new Set(table_ids.map(Number).filter((n) => Number.isFinite(n) && n > 0))]
+    : [];
+
+  // The number of tables per booking is enforced by validateReservationCreate (checkTableCount).
+
+  let effective_preferred_area_id = preferred_area_id;
+
+  if (!effective_preferred_area_id && tableIds.length > 0) {
+    const [tableAreaRows] = await pool.query(
+      `SELECT DISTINCT area_id FROM dbo.RestaurantTables WHERE table_id IN (${tableIds.join(',')})`
+    );
+    if (tableAreaRows.length > 1) {
+      return res.status(400).json({ success: false, message: "Selected tables must be in the same area." });
+    } else if (tableAreaRows.length === 1) {
+      effective_preferred_area_id = tableAreaRows[0].area_id;
+    }
+  }
+
+  let kitchenViewBooking = false;
+  let kitchenArea = null;
+
+  if (effective_preferred_area_id) {
+    const [areaRows] = await pool.query(
+      `SELECT TOP 1 area_id, area_name, area_type, is_active
+       FROM dbo.RestaurantAreas
+       WHERE area_id = ?;`,
+      [Number(effective_preferred_area_id)]
+    );
+    kitchenArea = areaRows[0] || null;
+    kitchenViewBooking = Boolean(kitchenArea && isKitchenViewAreaName(kitchenArea.area_name));
+  }
+
+  // Omakase area: the seating length is fixed, whatever end time the client sent.
+  if (kitchenArea && /omakase/i.test(String(kitchenArea.area_name || ""))) {
+    slotEnd = new Date(slotStart.getTime() + OMAKASE_SEATING_MINUTES * 60000);
+  }
+
+  if (!kitchenViewBooking && tableIds.length === 0) {
+    return res.status(400).json({
+      success: false,
+      message: "Please select at least one table.",
+    });
+  }
+
+  let customerId = Number(req.userId);
+
+  if (!Number.isFinite(customerId) || customerId <= 0) {
+    customerId = null;
+  }
+
+  if (!customerId) {
+    if (
+      !String(guestNameRaw || "").trim() ||
+      !String(guestEmailRaw || "").trim() ||
+      !String(guestPhoneRaw || "").trim()
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: "Guest reservations require full name, email, and phone.",
+      });
+    }
+  }
+
+  try {
+    const settings = await loadSettings();
+    const bufferMinutes = Number(settings.table_hold_min) || 15;
+
+    if (guestCount > settings.max_guests) {
+      return res.status(400).json({
+        success: false,
+        message: `Guest count cannot exceed ${settings.max_guests}. Please contact us for larger groups.`,
+      });
+    }
+
+    const openMin = timeToMinutes(settings.open_time);
+    const closeMin = timeToMinutes(settings.close_time);
+    const startMin = slotStart.getHours() * 60 + slotStart.getMinutes();
+    const endMin = startMin + Math.round((slotEnd - slotStart) / 60000);
+
+    if (
+      openMin != null &&
+      closeMin != null &&
+      (startMin < openMin || endMin > closeMin)
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: `Reservations must be between ${settings.open_time} and ${settings.close_time}.`,
+      });
+    }
+
+    // Service windows: lunch 10:00-15:00, dinner 17:00-22:00 (15:00-17:00 break).
+    const insideServiceWindow = [[600, 900], [1020, 1320]].some(
+      ([from, to]) => startMin >= from && endMin <= to
+    );
+    if (!insideServiceWindow) {
+      return res.status(400).json({
+        success: false,
+        message: "FUKU serves 10:00-15:00 and 17:00-22:00. Reservations cannot start or run into the 15:00-17:00 break.",
+      });
+    }
+
+    const effectiveDiningPurpose = dining_purpose || null;
+    const tableAssignmentStatus = getAssignmentMode(slotStart);
+    const isConfirmedAssignment = tableAssignmentStatus === TABLE_ASSIGNMENT_STATUS.CONFIRMED;
+    const finalSpecialRequestBase = special_request && special_request.trim() ? special_request.trim() : null;
+
+    const connection = await pool.getConnection();
+
+    try {
+      await connection.beginTransaction();
+
+      // [BMAD EXECUTE] Strict Time-Slot Overlap Prevention
+      if (effective_preferred_area_id && !kitchenViewBooking) {
+        // Fetch total capacity of the requested area
+        const [areaCapacityRows] = await connection.query(
+          `SELECT ISNULL(SUM(capacity), 0) AS total_capacity 
+           FROM dbo.RestaurantTables 
+           WHERE area_id = ? AND table_status != N'Inactive'`,
+          [effective_preferred_area_id]
+        );
+        const areaTotalCapacity = Number(areaCapacityRows[0]?.total_capacity || 0);
+
+        // Calculate overlaps
+        const [overlapRows] = await connection.query(
+          `SELECT ISNULL(SUM(guest_count), 0) AS total_overlapping_guests
+           FROM dbo.Reservations WITH (UPDLOCK, HOLDLOCK)
+           WHERE preferred_area_id = ?
+             AND reservation_status NOT IN (N'Cancelled', N'No Show', N'Reject Check-in', N'Completed')
+             AND ? < DATEADD(minute, ?, reservation_end_at)
+             AND ? > reservation_start_at`,
+          [effective_preferred_area_id, slotStart, bufferMinutes, slotEnd]
+        );
+        
+        const sumOverlappingGuests = Number(overlapRows[0]?.total_overlapping_guests || 0);
+
+        if (sumOverlappingGuests + guestCount > areaTotalCapacity) {
+          await connection.rollback();
+          connection.release();
+          return res.status(409).json({
+            success: false,
+            message: "The selected time slot is fully booked. Please choose a different time."
+          });
+        }
+      }
+
+      let checkRows = [];
+      let effectiveTableIds = tableIds;
+
+      if (kitchenViewBooking) {
+        const counterCapacity = await resolveKitchenViewCounterCapacity(
+          connection,
+          kitchenArea.area_id,
+          settings
+        );
+
+        if (guestCount > counterCapacity) {
+          await connection.rollback();
+          connection.release();
+          return res.status(400).json({
+            success: false,
+            message: `Kitchen View counter has ${counterCapacity} seats. Please reduce your party size or choose another area.`,
+          });
+        }
+
+        const seatsBooked = await getKitchenViewSeatsBooked(
+          connection,
+          kitchenArea.area_id,
+          slotStart,
+          slotEnd
+        );
+
+        if (seatsBooked + guestCount > counterCapacity) {
+          await connection.rollback();
+          connection.release();
+          return res.status(409).json({
+            success: false,
+            code: "SEATS_UNAVAILABLE",
+            message: `Only ${Math.max(0, counterCapacity - seatsBooked)} counter seat(s) remain for this time. Please choose another slot or area.`,
+          });
+        }
+
+        const placeholder = await getKitchenViewPlaceholderTableId(
+          connection,
+          kitchenArea.area_id
+        );
+
+        if (!placeholder) {
+          await connection.rollback();
+          connection.release();
+          return res.status(400).json({
+            success: false,
+            message: "Kitchen View counter is not configured. Please contact the restaurant.",
+          });
+        }
+
+        effectiveTableIds = [placeholder.table_id];
+        checkRows = [
+          {
+            table_id: placeholder.table_id,
+            table_number: placeholder.table_number,
+            capacity: counterCapacity,
+            table_status: "Available",
+            availability_at_slot: "Available",
+            area_name: KITCHEN_VIEW_AREA_NAME,
+          },
+        ];
+      } else {
+        const inPlaceholders = effectiveTableIds.map(() => "?").join(", ");
+
+        const [tableRows] = await connection.query(
+          `SELECT
+             t.table_id,
+             t.table_number,
+             (
+               t.capacity + ISNULL((
+                 SELECT SUM(c.capacity)
+                 FROM dbo.RestaurantTables c
+                 WHERE c.merged_into_table_id = t.table_id
+               ), 0)
+             ) AS capacity,
+             t.table_status,
+              CASE
+                WHEN t.table_status = N'Inactive'
+                  THEN N'Inactive'
+               WHEN EXISTS (
+                 SELECT 1
+                 FROM dbo.ReservationTables rt WITH (UPDLOCK, HOLDLOCK)
+                 JOIN dbo.Reservations r WITH (UPDLOCK, HOLDLOCK)
+                   ON rt.reservation_id = r.reservation_id
+                 WHERE rt.table_id = t.table_id
+                   AND r.reservation_status IN (${ACTIVE_RESERVATION_STATUS_SQL})
+                   AND DATEADD(minute, -?, r.reservation_start_at) < ?
+                   AND DATEADD(minute, ?, r.reservation_end_at) > ?
+               ) THEN N'Booked'
+               ELSE N'Available'
+             END AS availability_at_slot,
+             a.area_name
+           FROM dbo.RestaurantTables t
+           LEFT JOIN dbo.RestaurantAreas a ON t.area_id = a.area_id
+           WHERE t.table_id IN (${inPlaceholders});`,
+          [bufferMinutes, slotEnd, bufferMinutes, slotStart, ...effectiveTableIds]
+        );
+
+        checkRows = tableRows;
+
+        if (checkRows.length !== effectiveTableIds.length) {
+          await connection.rollback();
+          connection.release();
+
+          return res.status(400).json({
+            success: false,
+            message: "One or more selected tables do not exist.",
+          });
+        }
+      }
+
+
+      if (customerId) {
+        const [accountRows] = await connection.query(
+          `SELECT user_id
+           FROM dbo.UserAccounts
+           WHERE user_id = ?
+             AND is_active = 1`,
+          [customerId]
+        );
+
+        if (accountRows.length === 0) {
+          console.warn(
+            `User id ${customerId} from token does not exist in dbo.UserAccounts. Creating reservation as guest.`
+          );
+          customerId = null;
+        }
+      }
+
+      const conflict = kitchenViewBooking
+        ? null
+        : isConfirmedAssignment
+          ? checkRows.find((r) => r.availability_at_slot !== "Available")
+          : checkRows.find((r) => r.table_status === "Inactive");
+
+      if (conflict) {
+        await connection.rollback();
+        connection.release();
+
+        return res.status(409).json({
+          success: false,
+          code: "TABLE_UNAVAILABLE",
+          message:
+            "This table has just been booked or is unavailable. Please choose another table.",
+        });
+      }
+
+      const totalCapacity = kitchenViewBooking
+        ? guestCount
+        : checkRows.reduce((sum, r) => sum + Number(r.capacity), 0);
+
+      if (!kitchenViewBooking && totalCapacity < guestCount) {
+        await connection.rollback();
+        connection.release();
+
+        return res.status(400).json({
+          success: false,
+          message:
+            "Selected tables cannot seat your whole party. Please add another table.",
+        });
+      }
+
+      const initialStatus = "Awaiting Deposit";
+      const preferredTableForTags = checkRows[0] || null;
+      const finalSpecialRequest = kitchenViewBooking
+        ? finalSpecialRequestBase
+        : appendPreferredTableTags(finalSpecialRequestBase, {
+          tableId: preferredTableForTags?.table_id,
+          tableNumber: preferredTableForTags?.table_number,
+          assignmentMode: tableAssignmentStatus,
+        });
+
+      // AUTO-CONFIRM: INSERT directly as 'Pending Request'
+      const [scopeRows] = await connection.query(
+        `INSERT INTO dbo.Reservations
+           (customer_id, contact_name, contact_phone, contact_email, preferred_area_id,
+            reservation_start_at, reservation_end_at,
+            guest_count, special_request, dining_purpose, reservation_status, reservation_source,
+            confirmed_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, N'Online', SYSDATETIME());
+         SELECT CAST(SCOPE_IDENTITY() AS INT) AS reservation_id;`,
+        [
+          customerId,
+          guestNameRaw  || null,
+          guestPhoneRaw || null,
+          guestEmailRaw || null,
+          kitchenViewBooking
+            ? kitchenArea.area_id
+            : effective_preferred_area_id
+              ? Number(effective_preferred_area_id)
+              : null,
+          slotStart,
+          slotEnd,
+          guestCount,
+          finalSpecialRequest,
+          effectiveDiningPurpose || null,
+          initialStatus
+        ]
+      );
+
+      const reservationId = scopeRows[0]?.reservation_id;
+      if (!reservationId) throw new Error("Failed to retrieve reservation_id after INSERT. Check DB triggers or constraints.");
+
+      const created = { reservation_status: initialStatus, created_at: new Date() };
+
+
+      const tablesToAssign = effectiveTableIds.length
+        ? effectiveTableIds
+        : (preferredTableForTags?.table_id ? [preferredTableForTags.table_id] : []);
+
+      try {
+        await assertItemsAllowedForTables(tablesToAssign, Array.isArray(preorderItemsRaw) ? preorderItemsRaw : []);
+      } catch (policyError) {
+        await connection.rollback();
+        connection.release();
+        if (policyError instanceof PolicyError) return sendPolicyError(res, policyError);
+        throw policyError;
+      }
+
+      for (const tableId of tablesToAssign) {
+        await connection.query(
+          `INSERT INTO dbo.ReservationTables (reservation_id, table_id)
+           VALUES (?, ?);`,
+          [reservationId, tableId]
+        );
+      }
+
+      
+      let paymentUrl = null;
+      let totalAmount = 0;
+      let validPreorderItems = [];
+
+      if (Array.isArray(preorderItemsRaw) && preorderItemsRaw.length > 0) {
+        // Collect valid items and calculate total amount
+        for (const item of preorderItemsRaw) {
+          const dishId = Number(item.dish_id || item.dishId || item.id);
+          const qty = Number(item.quantity || item.qty || 1);
+
+          if (!Number.isFinite(dishId) || dishId <= 0 || !Number.isFinite(qty) || qty <= 0) continue;
+
+          const [dishRows] = await connection.query(
+            `SELECT price FROM dbo.Dishes WHERE dish_id = ? AND is_available = 1`,
+            [dishId]
+          );
+
+          if (dishRows.length > 0) {
+            const unitPrice = Number(dishRows[0].price);
+            validPreorderItems.push({ dishId, qty, unitPrice, notes: item.notes || null });
+            totalAmount += unitPrice * qty;
+            console.log(`[DEBUG TRACE 1] Added preorder item ${dishId}, qty: ${qty}, unitPrice: ${unitPrice}. Current totalAmount: ${totalAmount}`);
+          }
+        }
+
+        console.log(`[DEBUG TRACE 2] Finished Preorder Items loop. Final totalAmount from preorder: ${totalAmount}`);
+
+        if (validPreorderItems.length > 0) {
+          // 1. Insert PreorderItems
+          for (const item of validPreorderItems) {
+            await connection.query(
+              `INSERT INTO dbo.PreorderItems (reservation_id, dish_id, quantity, unit_price, notes) VALUES (?, ?, ?, ?, ?)`,
+              [reservationId, item.dishId, item.qty, item.unitPrice, item.notes]
+            );
+          }
+
+          // 2. Create Order
+          const [orderRows] = await connection.query(
+            `INSERT INTO dbo.Orders (reservation_id, table_id, customer_id, order_type, order_status, subtotal, total_amount)
+             VALUES (?, ?, ?, N'Preorder', N'Open', ?, ?);
+             SELECT CAST(SCOPE_IDENTITY() AS INT) AS order_id;`,
+            [reservationId, effectiveTableIds[0], customerId || null, totalAmount, totalAmount]
+          );
+          const newOrderId = orderRows[0].order_id;
+
+          // 3. Create OrderItems
+          for (const item of validPreorderItems) {
+            await connection.query(
+              `INSERT INTO dbo.OrderItems (order_id, dish_id, quantity, unit_price, notes) VALUES (?, ?, ?, ?, ?)`,
+              [newOrderId, item.dishId, item.qty, item.unitPrice, item.notes]
+            );
+          }
+
+          // 4. Create Payment (VNPAY Method ID is typically assumed to be created or resolved)
+          // We look up the VNPAY payment method ID, fallback to 1 if not found.
+          const [methodRows] = await connection.query(`SELECT payment_method_id FROM dbo.PaymentMethods WHERE method_name = 'VNPAY'`);
+          const paymentMethodId = methodRows.length > 0 ? methodRows[0].payment_method_id : 1; // Assuming 'VNPAY' is inserted later if missing
+
+          await connection.query(
+            `INSERT INTO dbo.Payments (order_id, payment_method_id, amount_paid, payment_status)
+             VALUES (?, ?, ?, N'Pending');`,
+            [newOrderId, paymentMethodId, totalAmount]
+          );
+
+          // Note: Payment URL is no longer generated here. 
+          // The frontend will call /api/payments/create_vnpay_url in step 3 (process-payment).
+        }
+      }
+
+      const guestName = String(guestNameRaw || "").trim() || "Guest";
+      const startLabel = `${String(slotStart.getHours()).padStart(2, "0")}:${String(
+        slotStart.getMinutes()
+      ).padStart(2, "0")}`;
+
+
+
+
+      // Audit log
+      await connection.query(
+        `INSERT INTO dbo.AuditLogs (user_id, action_name, target_table, target_id, old_value_json, new_value_json, ip_address, created_at)
+         VALUES (?, N'RESERVATION_CREATED', N'Reservations', ?, ?, ?, ?, SYSDATETIME())`,
+        [
+          customerId || null,
+          reservationId,
+          null,
+          JSON.stringify({ reservation_status: initialStatus, guest_count: guestCount }),
+          req.ip
+        ]
+      );
+
+      // Notification for manager (user_id = 2 per PRD)
+      await connection.query(
+        `INSERT INTO dbo.Notifications (user_id, notification_type, title, message_body, is_read, sent_at)
+         VALUES (?, N'System', N'New Reservation Request', ?, 0, SYSDATETIME())`,
+        [
+          2, // Manager
+          `New reservation from ${guestName} for ${guestCount} guests on ${formatLocalIso(slotStart)} at ${startLabel}`
+        ]
+      );
+
+      // Notification for customer if authenticated
+      if (customerId) {
+        await connection.query(
+          `INSERT INTO dbo.Notifications (user_id, notification_type, title, message_body, is_read, sent_at)
+           VALUES (?, N'Booking Reminder', N'Reservation Submitted 📝', ?, 0, SYSDATETIME())`,
+          [
+            customerId,
+            `Your reservation request #${reservationId} for ${guestCount} guest(s) on ${formatLocalIso(slotStart)} at ${startLabel} has been received!`
+          ]
+        );
+
+      }
+
+      const tableSummaries = kitchenViewBooking
+        ? [
+          {
+            table_id: checkRows[0]?.table_id,
+            table_number: "COUNTER",
+            display_label: `${KITCHEN_VIEW_AREA_NAME} · ${guestCount} seat(s)`,
+            capacity: guestCount,
+          },
+        ]
+        : checkRows.map((r) => {
+          const meta = TABLE_DISPLAY[r.table_number] || {
+            displayLabel: r.table_number,
+          };
+
+          return {
+            table_id: r.table_id,
+            table_number: r.table_number,
+            display_label: meta.displayLabel,
+            capacity: r.capacity,
+          };
+        });
+
+      const tableLabel =
+        tableSummaries
+          .map((t) => t.display_label || t.table_number)
+          .filter(Boolean)
+          .join(", ") || "—";
+
+      const io = getIO();
+      if (io) {
+        const newPayload = {
+          reservation_id: reservationId,
+          customer_name: guestName,
+          customer_phone: guestPhoneRaw || null,
+          email: guestEmailRaw || null,
+          reservation_start_at: formatLocalIso(slotStart),
+          reservation_date: slotStart.toISOString().slice(0, 10),
+          start_time: startLabel,
+          guest_count: guestCount,
+          party_size: guestCount,
+          area_name: kitchenViewBooking ? KITCHEN_VIEW_AREA_NAME : (checkRows[0]?.area_name || "General"),
+          special_request: finalSpecialRequest,
+          status: "confirmed",
+          reservation_status: initialStatus,
+          table_label: tableLabel,
+        };
+        io.to("room:manager").emit("reservation:new", newPayload);
+        io.to("room:staff").emit("reservation:new", newPayload);
+      }
+
+      // Fire-and-forget confirmation email — never crash the response
+      if (guestEmailRaw) {
+        const resDate = slotStart.toLocaleDateString("vi-VN", { day: "2-digit", month: "2-digit", year: "numeric" });
+        const resTime = `${String(slotStart.getHours()).padStart(2, "0")}:${String(slotStart.getMinutes()).padStart(2, "0")}`;
+        const parsedAreaName = kitchenViewBooking
+          ? KITCHEN_VIEW_AREA_NAME
+          : (checkRows[0]?.area_name || null);
+        // Compute duration from actual slot diff (reliable) — fall back to frontend label
+        const durationMs = slotEnd.getTime() - slotStart.getTime();
+        const durationMins = Math.round(durationMs / 60000);
+        const durationLabel = duration
+          ? String(duration)
+          : durationMins > 0
+            ? `${durationMins} minutes`
+            : null;
+        const effectivePurpose = dining_purpose || null;
+        sendBookingConfirmationEmail({
+          toEmail:         guestEmailRaw,
+          customerName:    guestName,
+          customerPhone:   guestPhoneRaw || null,
+          reservationDate: resDate,
+          reservationTime: resTime,
+          reservationId,
+          diningPurpose:   effectivePurpose,
+          duration:        durationLabel,
+          areaName:        parsedAreaName,
+          tables:          tableSummaries,
+        }).catch((e) => console.error("[Email fire-and-forget] confirmationEmail failed:", e?.message));
+      }
+
+      // Fetch saved preorder items with dish names for response
+      let savedPreorderItems = [];
+      if (preorderItemsRaw && preorderItemsRaw.length > 0) {
+        try {
+          const [pRows] = await pool.query(
+            `SELECT pi.preorder_item_id, pi.dish_id, pi.quantity, pi.unit_price, pi.notes,
+                    d.dish_name
+             FROM dbo.PreorderItems pi
+             LEFT JOIN dbo.Dishes d ON pi.dish_id = d.dish_id
+             WHERE pi.reservation_id = ?
+             ORDER BY pi.created_at ASC`,
+            [reservationId]
+          );
+          savedPreorderItems = pRows;
+        } catch (e) {
+          console.error('[preorderItems fetch]', e?.message);
+        }
+      }
+
+      // 1. Calculate the raw total of all pre-ordered items
+      const preorderItemsTotal = totalAmount || 0;
+
+      // 2. Define the Base Table Deposit
+      const BASE_TABLE_DEPOSIT = 20000 * Math.max(1, effectiveTableIds.length);
+
+      // 3. Define the exact money the customer MUST pay upfront via QR right now
+      // 30% deposit of food + table, remaining 70% paid at checkout.
+      // NOTE: We don't have discount_amount computed here yet in this legacy route.
+      const net_total = BASE_TABLE_DEPOSIT + preorderItemsTotal;
+      const deposit_amount = Math.round(net_total * 0.3);
+      const final_total = net_total - deposit_amount;
+
+      console.log(`[AUTOMATION CHECK] Preorder: ${preorderItemsTotal} | Table Deposit: ${BASE_TABLE_DEPOSIT} | Net Total: ${net_total} | QR Target (30%): ${deposit_amount} | Remaining (70%): ${final_total}`);
+      
+      const order_code = `RES${reservationId}`;
+
+      // Update the DB with the newly generated order_code and precise financial values
+      await connection.query(
+        `UPDATE dbo.Reservations 
+         SET deposit_amount = ?, final_total = ?, order_code = ?
+         WHERE reservation_id = ?`,
+        [deposit_amount, final_total, order_code, reservationId]
+      );
+
+      const qr_url = paymentQrUrl(deposit_amount, order_code);
+
+      const responsePayload = {
+        success: true,
+        deposit_amount,
+        final_total, // For frontend compatibility with pre-save logic
+        order_code,
+        qr_url,
+        reservation: {
+          reservation_id: reservationId,
+          reservation_status: initialStatus,
+          reservation_start_at: formatLocalIso(slotStart),
+          reservation_end_at: formatLocalIso(slotEnd),
+          guest_count: guestCount,
+          special_request: finalSpecialRequest,
+          table_assignment_status: kitchenViewBooking
+            ? TABLE_ASSIGNMENT_STATUS.CONFIRMED
+            : tableAssignmentStatus,
+          preferred_table_id: preferredTableForTags?.table_id || null,
+          preferred_table_number: preferredTableForTags?.table_number || null,
+          preferred_area_id: kitchenViewBooking
+            ? kitchenArea.area_id
+            : effective_preferred_area_id
+              ? Number(effective_preferred_area_id)
+              : null,
+          tables: tableSummaries,
+          is_guest: !customerId,
+          preorderItems: savedPreorderItems,
+        },
+        table_assignment_status: kitchenViewBooking
+          ? TABLE_ASSIGNMENT_STATUS.CONFIRMED
+          : tableAssignmentStatus,
+        table_assignment_message: isConfirmedAssignment || kitchenViewBooking
+          ? "Your table is confirmed for this reservation."
+          : "Your selected table is recorded as a preference. Staff will confirm the final table closer to your visit.",
+      };
+
+      if (typeof paymentUrl !== 'undefined' && paymentUrl) {
+        responsePayload.paymentUrl = paymentUrl;
+      }
+
+      // --- BACKEND SWEEPER LOGIC ---
+      // 15-minute auto-cancel for pending payments
+      setTimeout(async () => {
+        try {
+          const [checkRes] = await pool.query('SELECT reservation_status FROM dbo.Reservations WHERE reservation_id = ?', [reservationId]);
+            
+          if (checkRes.length > 0 && checkRes[0].reservation_status === RESERVATION_STATUS.PENDING_PAYMENT) {
+            // Auto cancel
+            await updateReservationStatus({
+              connection: pool,
+              reservationId: reservationId,
+              toStatus: RESERVATION_STATUS.CANCELLED,
+              staffId: null,
+              auditAction: "PAYMENT_TIMEOUT_AUTO_CANCEL",
+              extraUpdates: ", cancel_reason = N'Payment Timeout (Auto Swept)', cancelled_at = SYSDATETIME()"
+            });
+            console.log(`[Sweeper] Reservation ${reservationId} was swept and cancelled due to payment timeout.`);
+            
+            // Note: We might also want to broadcast this cancellation
+            const io = getIO();
+            if (io) {
+              io.emit("reservation:status_changed", { reservation_id: reservationId, status: "Cancelled" });
+            }
+          }
+        } catch (e) {
+          console.error(`[Sweeper Error] Failed to sweep reservation ${reservationId}:`, e);
+        }
+      }, 15 * 60 * 1000); // 15 minutes
+      // -----------------------------
+
+      await connection.commit();
+      connection.release();
+
+      return res.status(201).json(responsePayload);
+
+    } catch (txError) {
+      try {
+        await connection.rollback();
+      } catch {
+        /* ignore rollback failure */
+      }
+
+      connection.release();
+      throw txError;
+    }
+  } catch (error) {
+    console.error("CRITICAL Create reservation error:", error);
+
+    // Check if it's a SQL error (tedious/mssql) to extract specific details
+    const sqlErrorDetail = error.originalError ? error.originalError.message : error.message;
+
+    return res.status(500).json({
+      success: false,
+      message: "Internal server error while creating reservation.",
+      error: sqlErrorDetail // EXPOSE RAW ERROR TO FRONTEND
+    });
+  }
+});
+
+/* ------------------------------------------------------------------ */
+/* GET /api/reservations/my                                            */
+/* ------------------------------------------------------------------ */
+
+router.get("/my", resolveUserId, requireUserId, async (req, res) => {
+  try {
+    await expireOldHolds();
+    await sweepNoShows().catch((err) => console.error("[GET /reservations/my] Auto sweep failed:", err.message));
+
+    const selectedDate = String(req.query.date || "").trim();
+    if (selectedDate && !/^\d{4}-\d{2}-\d{2}$/.test(selectedDate)) {
+      return res.status(400).json({
+        success: false,
+        code: "INVALID_DATE_FILTER",
+        message: "Date filter must use YYYY-MM-DD format.",
+      });
+    }
+
+    const queryParams = [req.userId, req.userId];
+    let dateFilterSql = "";
+    if (selectedDate) {
+      dateFilterSql = " AND CAST(r.reservation_start_at AS DATE) = CAST(? AS DATE)";
+      queryParams.push(selectedDate);
+    }
+
+    const [rows] = await pool.query(
+      `SELECT
+         r.reservation_id,
+         COALESCE(ua.full_name, r.contact_name, N'') AS customer_name,
+         COALESCE(ua.phone, r.contact_phone, N'') AS customer_phone,
+         COALESCE(ua.email, r.contact_email, N'') AS customer_email,
+         r.reservation_start_at,
+         r.reservation_end_at,
+         r.guest_count,
+         r.special_request,
+         r.dining_purpose,
+         r.reservation_status AS status,
+         r.has_pending_request,
+         r.request_type,
+         r.edit_used_count,
+         r.created_at AS created_time,
+         r.cancelled_at,
+         r.cancel_reason,
+         a.area_name AS preferred_area,
+         a.area_type
+       FROM dbo.Reservations r
+       LEFT JOIN dbo.UserAccounts ua ON r.customer_id = ua.user_id
+       LEFT JOIN dbo.RestaurantAreas a ON r.preferred_area_id = a.area_id
+       WHERE (
+          r.customer_id = ?
+          OR (
+            r.customer_id IS NULL
+            AND r.contact_email IS NOT NULL
+            AND LOWER(r.contact_email) = LOWER((
+              SELECT TOP 1 email
+              FROM dbo.UserAccounts
+              WHERE user_id = ?
+            ))
+          )
+       )
+          ${dateFilterSql}
+       ORDER BY r.reservation_start_at DESC;`,
+      queryParams
+    );
+
+    const ids = rows.map((r) => r.reservation_id);
+    let tablesByReservation = {};
+    let preorderByReservation = {};
+    let orderHistoryByReservation = {};
+
+    if (ids.length > 0) {
+      const placeholders = ids.map(() => "?").join(", ");
+
+      const [tableRows] = await pool.query(
+        `SELECT rt.reservation_id, t.table_id, t.table_number, t.capacity, t.area_id, a.area_name
+         FROM dbo.ReservationTables rt
+         JOIN dbo.RestaurantTables t ON rt.table_id = t.table_id
+         LEFT JOIN dbo.RestaurantAreas a ON t.area_id = a.area_id
+         WHERE rt.reservation_id IN (${placeholders});`,
+        ids
+      );
+
+      tablesByReservation = tableRows.reduce((acc, row) => {
+        const meta = TABLE_DISPLAY[row.table_number] || {
+          displayLabel: row.table_number,
+        };
+
+        acc[row.reservation_id] = acc[row.reservation_id] || [];
+
+        acc[row.reservation_id].push({
+          table_id: row.table_id,
+          table_number: row.table_number,
+          display_label: meta.displayLabel,
+          capacity: row.capacity,
+          area_id: row.area_id ?? null,
+          area_name: row.area_name ?? null,
+        });
+
+        return acc;
+      }, {});
+
+      const [preorderRows] = await pool.query(
+        `SELECT p.reservation_id,
+                p.dish_id,
+                p.quantity,
+                p.unit_price,
+                d.dish_name
+         FROM dbo.PreorderItems p
+         JOIN dbo.Dishes d ON p.dish_id = d.dish_id
+         WHERE p.reservation_id IN (${placeholders});`,
+        ids
+      );
+
+      preorderByReservation = preorderRows.reduce((acc, row) => {
+        acc[row.reservation_id] = acc[row.reservation_id] || [];
+
+        acc[row.reservation_id].push({
+          dish_id: row.dish_id,
+          dish_name: row.dish_name,
+          quantity: row.quantity,
+          unit_price: Number(row.unit_price),
+        });
+
+        return acc;
+      }, {});
+
+      const [orderHistoryRows] = await pool.query(
+        `SELECT o.reservation_id,
+                o.order_id,
+                o.order_type,
+                o.order_status,
+                o.created_at,
+                o.total_amount,
+                oi.order_item_id,
+                oi.quantity,
+                oi.unit_price,
+                oi.item_status,
+                d.dish_name
+         FROM dbo.Orders o
+         LEFT JOIN dbo.OrderItems oi ON oi.order_id = o.order_id
+         LEFT JOIN dbo.Dishes d ON d.dish_id = oi.dish_id
+         WHERE o.reservation_id IN (${placeholders})
+           AND o.order_type <> N'Preorder'
+         ORDER BY o.created_at ASC, o.order_id ASC, oi.order_item_id ASC;`,
+        ids
+      );
+
+      orderHistoryByReservation = orderHistoryRows.reduce((acc, row) => {
+        const reservationOrders = acc[row.reservation_id] || [];
+        let order = reservationOrders.find((item) => item.order_id === row.order_id);
+        if (!order) {
+          order = {
+            order_id: row.order_id,
+            order_type: row.order_type,
+            order_status: row.order_status,
+            created_at: row.created_at,
+            total_amount: Number(row.total_amount || 0),
+            items: [],
+          };
+          reservationOrders.push(order);
+          acc[row.reservation_id] = reservationOrders;
+        }
+
+        if (row.order_item_id) {
+          order.items.push({
+            order_item_id: row.order_item_id,
+            dish_name: row.dish_name,
+            quantity: Number(row.quantity || 0),
+            unit_price: Number(row.unit_price || 0),
+            item_status: row.item_status,
+          });
+        }
+        return acc;
+      }, {});
+    }
+
+    const reservations = rows.map((r) => {
+      const assignedTables = tablesByReservation[r.reservation_id] || [];
+      const assigned_tables = assignedTables.map(t => t.table_number).join(", ");
+      const assignedAreaName = assignedTables.find(t => t.area_name)?.area_name || null;
+      const parsedPreference = parsePreferredTableTags(r.special_request);
+      const hasConfirmedTable = assignedTables.length > 0;
+      return {
+        reservation_id: r.reservation_id,
+        customer_name: r.customer_name,
+        customer_phone: r.customer_phone,
+        customer_email: r.customer_email,
+        reservation_start_at: r.reservation_start_at,
+        reservation_end_at: r.reservation_end_at,
+        guest_count: r.guest_count,
+        special_request: r.special_request,
+        dining_purpose: r.dining_purpose,
+        reservation_status: r.status,
+        status: r.status,
+        has_pending_request: Boolean(r.has_pending_request),
+        request_type: r.request_type || null,
+        edit_used_count: Number(r.edit_used_count || 0),
+        created_time: r.created_time,
+        created_at: r.created_time,
+        cancelled_at: r.cancelled_at,
+        cancel_reason: r.cancel_reason,
+        preferred_area: r.preferred_area,
+        assigned_area_name: assignedAreaName,
+        area_name: assignedAreaName || r.preferred_area,
+        area_type: r.area_type,
+        assigned_tables: assigned_tables,
+        tables: assignedTables,
+        table_assignment_status: hasConfirmedTable
+          ? TABLE_ASSIGNMENT_STATUS.CONFIRMED
+          : parsedPreference.table_assignment_status || TABLE_ASSIGNMENT_STATUS.PREFERRED,
+        needs_table_finalization: !hasConfirmedTable,
+        preferred_table_id: parsedPreference.preferred_table_id,
+        preferred_table_number: parsedPreference.preferred_table_number,
+        preferred_table_label: parsedPreference.preferred_table_number
+          ? `${parsedPreference.preferred_table_number} (preference)`
+          : null,
+        preorders: preorderByReservation[r.reservation_id] || [],
+        preorder_items: preorderByReservation[r.reservation_id] || [],
+        order_history: orderHistoryByReservation[r.reservation_id] || [],
+      };
+    });
+
+    return res.json({ success: true, reservations });
+  } catch (error) {
+    console.error("Load my reservations failed:", error);
+
+    return res.status(500).json({
+      success: false,
+      message: "Could not load your reservations.",
+    });
+  }
+});
+
+/* ------------------------------------------------------------------ */
+/* POST /api/reservations/:id/upgrade-quote                            */
+/* POST /api/reservations/:id/verify-upgrade                           */
+/* ------------------------------------------------------------------ */
+router.post("/:id/upgrade-quote", resolveUserId, requireUserId, getUpgradeQuote);
+router.post("/:id/verify-upgrade", resolveUserId, requireUserId, (req,res,next) => { if (!req.body?.pending_changes || typeof req.body.pending_changes !== 'object' || Array.isArray(req.body.pending_changes)) {
+    return res.status(400).json({message:'Reservation changes are required.'});
+  }
+  req.body.changes=req.body.pending_changes;
+  next(); }, validateReservationUpdate, verifyUpgradePayment);
+
+/* ------------------------------------------------------------------ */
+/* PATCH /api/reservations/:id/cancel                                  */
+/* ------------------------------------------------------------------ */
+
+router.patch("/:id/cancel", resolveUserId, requireUserId, async (req, res) => {
+  try {
+    const reservationId = Number(req.params.id);
+
+    if (!Number.isFinite(reservationId) || reservationId <= 0) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid reservation id.",
+      });
+    }
+
+    const [rows] = await pool.query(
+      `SELECT reservation_id,
+              customer_id,
+              reservation_status,
+              reservation_start_at
+       FROM dbo.Reservations
+       WHERE reservation_id = ?;`,
+      [reservationId]
+    );
+
+    const reservation = rows[0];
+
+    if (!reservation) {
+      return res.status(404).json({
+        success: false,
+        message: "Reservation not found.",
+      });
+    }
+
+    if (Number(reservation.customer_id) !== Number(req.userId)) {
+      return res.status(403).json({
+        success: false,
+        message: "You cannot modify this reservation.",
+      });
+    }
+
+    const blocked = [RESERVATION_STATUS.DINING, RESERVATION_STATUS.COMPLETED, RESERVATION_STATUS.NO_SHOW, RESERVATION_STATUS.CANCELLED];
+
+    if (blocked.includes(reservation.reservation_status)) {
+      return res.status(400).json({
+        success: false,
+        message: `Reservation cannot be cancelled (status: ${reservation.reservation_status}).`,
+      });
+    }
+
+    const settings = await loadSettings();
+    const startAt = new Date(reservation.reservation_start_at);
+    const deadlineMs = settings.cancel_deadline_h * 3600000;
+
+    if (startAt.getTime() - Date.now() < deadlineMs) {
+      return res.status(400).json({
+        success: false,
+        message: `Reservations must be cancelled at least ${settings.cancel_deadline_h} hour(s) in advance.`,
+      });
+    }
+
+    const reason = String(
+      req.body?.cancel_reason || "Cancelled by customer"
+    ).slice(0, 255);
+
+    await updateReservationStatus({
+      connection: pool,
+      reservationId,
+      toStatus: RESERVATION_STATUS.CANCELLED,
+      staffId: null,
+      auditAction: "CUSTOMER_CANCELLED_RESERVATION",
+      extraUpdates: `, cancel_reason = N'${reason.replace(/'/g, "''")}', cancelled_at = SYSDATETIME()`
+    });
+
+    return res.json({
+      success: true,
+      message: "Reservation cancelled.",
+    });
+  } catch (error) {
+    console.error("Cancel reservation failed:", error);
+
+    return res.status(500).json({
+      success: false,
+      message: "Could not cancel reservation.",
+    });
+  }
+});
+
+/* ------------------------------------------------------------------ */
+/* POST /api/reservations/:id/preorder                                 */
+/* ------------------------------------------------------------------ */
+
+router.post("/:id/preorder", resolveUserId, requireUserId, async (req, res) => {
+  const reservationId = Number(req.params.id);
+
+  if (!Number.isFinite(reservationId) || reservationId <= 0) {
+    return res.status(400).json({
+      success: false,
+      message: "Invalid reservation id.",
+    });
+  }
+
+  const rawItems = Array.isArray(req.body?.items) ? req.body.items : [];
+  const wantedQty = new Map();
+  const notesByDish = new Map();
+
+  for (const item of rawItems) {
+    const dishId = Number(item?.dish_id);
+    const qty = Math.floor(Number(item?.quantity));
+
+    if (!Number.isFinite(dishId) || dishId <= 0) continue;
+    if (!Number.isFinite(qty) || qty <= 0) continue;
+
+    wantedQty.set(dishId, (wantedQty.get(dishId) || 0) + qty);
+
+    if (item?.notes && !notesByDish.has(dishId)) {
+      notesByDish.set(dishId, String(item.notes).slice(0, 255));
+    }
+  }
+
+  try {
+    const [resRows] = await pool.query(
+      `SELECT reservation_id,
+              customer_id,
+              reservation_status
+       FROM dbo.Reservations
+       WHERE reservation_id = ?;`,
+      [reservationId]
+    );
+
+    const reservation = resRows[0];
+
+    if (!reservation) {
+      return res.status(404).json({
+        success: false,
+        message: "Reservation not found.",
+      });
+    }
+
+    if (Number(reservation.customer_id) !== Number(req.userId)) {
+      return res.status(403).json({
+        success: false,
+        message: "You cannot modify this reservation.",
+      });
+    }
+
+    const allowed = [RESERVATION_STATUS.PENDING_REQUEST, RESERVATION_STATUS.CONFIRMED, RESERVATION_STATUS.PENDING_PAYMENT, RESERVATION_STATUS.RESERVED];
+
+    if (!allowed.includes(reservation.reservation_status)) {
+      return res.status(400).json({
+        success: false,
+        message: `Pre-orders can only be edited while a reservation is pending or confirmed (current: ${reservation.reservation_status}).`,
+      });
+    }
+
+    const dishIds = [...wantedQty.keys()];
+
+    const connection = await pool.getConnection();
+
+    try {
+      await connection.beginTransaction();
+
+      try {
+        await assertItemsAllowedForReservation(reservationId, dishIds);
+      } catch (policyError) {
+        await connection.rollback();
+        connection.release();
+        if (policyError instanceof PolicyError) return sendPolicyError(res, policyError);
+        throw policyError;
+      }
+
+      await connection.query(
+        `DELETE FROM dbo.PreorderItems
+         WHERE reservation_id = ?;`,
+        [reservationId]
+      );
+
+      let insertedItems = [];
+
+      if (dishIds.length > 0) {
+        const placeholders = dishIds.map(() => "?").join(", ");
+
+        const [dishRows] = await connection.query(
+          `SELECT dish_id, dish_name, price
+           FROM dbo.Dishes
+           WHERE dish_id IN (${placeholders})
+             AND is_available = 1;`,
+          dishIds
+        );
+
+        if (dishRows.length !== dishIds.length) {
+          await connection.rollback();
+          connection.release();
+
+          return res.status(400).json({
+            success: false,
+            message: "One or more selected dishes are not available.",
+          });
+        }
+
+        for (const dish of dishRows) {
+          const qty = wantedQty.get(dish.dish_id);
+          const notes = notesByDish.get(dish.dish_id) || null;
+
+          await connection.query(
+            `INSERT INTO dbo.PreorderItems
+               (reservation_id, dish_id, quantity, unit_price, notes)
+             VALUES (?, ?, ?, ?, ?);`,
+            [reservationId, dish.dish_id, qty, Number(dish.price), notes]
+          );
+
+          insertedItems.push({
+            dish_id: dish.dish_id,
+            dish_name: dish.dish_name,
+            quantity: qty,
+            unit_price: Number(dish.price),
+          });
+        }
+      }
+
+      await connection.commit();
+      connection.release();
+
+      const total = insertedItems.reduce(
+        (sum, i) => sum + i.unit_price * i.quantity,
+        0
+      );
+
+      return res.json({
+        success: true,
+        message: insertedItems.length ? "Pre-order saved." : "Pre-order cleared.",
+        reservation_id: reservationId,
+        preorders: insertedItems,
+        preorder_total: total,
+      });
+    } catch (txError) {
+      try {
+        await connection.rollback();
+      } catch {
+        /* ignore rollback failure */
+      }
+
+      connection.release();
+      throw txError;
+    }
+  } catch (error) {
+    console.error("Save preorder failed:", error);
+
+    return res.status(500).json({
+      success: false,
+      message: "Could not save pre-order. Please try again.",
+    });
+  }
+});
+
+/* ------------------------------------------------------------------ */
+/* POST /api/reservations/:id/request-edit  (Flow B)                  */
+/* ------------------------------------------------------------------ */
+
+router.post("/:id/request-edit", resolveUserId, requireUserId, validateReservationUpdate, async (req, res) => {
+  const reservationId = Number(req.params.id);
+  if (!Number.isFinite(reservationId) || reservationId <= 0) {
+    return res.status(400).json({ success: false, message: "Invalid reservation ID." });
+  }
+
+  const customerId = req.userId ? Number(req.userId) : null;
+  const { changes } = req.body || {};
+
+  if (!changes || typeof changes !== "object" || Array.isArray(changes)) {
+    return res.status(400).json({
+      success: false,
+      code: "MISSING_CHANGES",
+      message: "Request body must include a 'changes' object with the fields to update.",
+    });
+  }
+
+  try {
+    // Omakase seating policy on the final tables + pre-order the request would produce.
+    const currentTableIds = await tableIdsOfReservation(reservationId);
+    const wantedTableIds = Array.isArray(changes.table_ids)
+      ? changes.table_ids
+      : changes.table_id
+        ? [changes.table_id]
+        : [];
+    const finalTableIds = wantedTableIds.length ? wantedTableIds : currentTableIds;
+    if (wantedTableIds.length) await assertSameSeatingKind(currentTableIds, wantedTableIds);
+    let finalItems = Array.isArray(changes.preorder_items) ? changes.preorder_items : null;
+    if (!finalItems && wantedTableIds.length) {
+      const [curItems] = await pool.query(
+        `SELECT dish_id FROM dbo.PreorderItems WHERE reservation_id = ?`,
+        [reservationId]
+      );
+      finalItems = curItems;
+    }
+    await assertItemsAllowedForTables(finalTableIds, finalItems || []);
+
+    const result = await submitEditRequest(reservationId, customerId, changes, req.ip);
+    if (!result.success) {
+      const statusMap = {
+        NOT_FOUND: 404,
+        FORBIDDEN: 403,
+        EDIT_LIMIT_REACHED: 409,
+        REQUEST_ALREADY_PENDING: 409,
+        INVALID_STATUS: 409,
+        NO_VALID_CHANGES: 400,
+        INVALID_FIELDS: 400,
+        PAYMENT_REQUIRED: 402,
+      };
+      return res.status(statusMap[result.code] || 400).json(result);
+    }
+    return res.json({ success: true, request_id: result.request_id || null, message: "Edit request submitted successfully." });
+  } catch (err) {
+    if (err.status) return res.status(err.status).json({message:err.message});
+    console.error("[POST /:id/request-edit] Error:", err);
+    return res.status(500).json({ success: false, message: "Internal server error." });
+  }
+});
+
+/* ------------------------------------------------------------------ */
+/* POST /api/reservations/:id/request-cancel  (Cancel Request)        */
+/* ------------------------------------------------------------------ */
+
+router.post("/:id/request-cancel", resolveUserId, async (req, res) => {
+  const reservationId = Number(req.params.id);
+  if (!Number.isFinite(reservationId) || reservationId <= 0) {
+    return res.status(400).json({ success: false, message: "Invalid reservation ID." });
+  }
+
+  const customerId = req.userId ? Number(req.userId) : null;
+  const { cancelReason, cancel_reason } = req.body || {};
+  const actualReason = cancelReason || cancel_reason || null;
+
+  try {
+    const result = await submitCancelRequest(
+      reservationId,
+      customerId,
+      actualReason,
+      req.ip
+    );
+    if (!result.success) {
+      const statusMap = {
+        NOT_FOUND: 404,
+        FORBIDDEN: 403,
+        REQUEST_ALREADY_PENDING: 409,
+        INVALID_STATUS: 409,
+      };
+      return res.status(statusMap[result.code] || 400).json(result);
+    }
+    return res.json({ success: true, request_id: result.request_id || null, message: "Cancellation request submitted. Awaiting manager review." });
+  } catch (err) {
+    console.error("[POST /:id/request-cancel] Error:", err);
+    return res.status(500).json({ success: false, message: "Internal server error." });
+  }
+});
+
+export default router;
