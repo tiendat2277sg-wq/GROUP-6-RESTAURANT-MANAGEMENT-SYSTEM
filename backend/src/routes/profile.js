@@ -1,0 +1,243 @@
+import express from "express";
+import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import multer from "multer";
+import {uploadStorage,persistUpload} from "../storage.js";
+import pool from "../db.js";
+import { resolveUserId, requireUserId } from "../middleware/authMiddleware.js";
+import {
+  getProfileForUser,
+  updateUserProfile,
+  parsePreferences,
+  serializePreferences,
+} from "../utils/profileService.js";
+import {
+  isPhoneOnlyProfileUpdate,
+  validatePhoneUpdatePayload,
+  validateProfilePayload,
+} from "../utils/validation.js";
+
+const router = express.Router();
+router.use(resolveUserId, requireUserId);
+router.param("userId", (req, res, next, value) => {
+  if (Number(value) !== req.userId) return res.status(403).json({ message: "Access denied." });
+  next();
+});
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const uploadsDir = path.join(__dirname, "../uploads/avatars");
+
+const upload = multer({
+  storage: uploadStorage("avatars", (_req, file, cb) => {
+      const ext = path.extname(file.originalname || ".jpg").toLowerCase() || ".jpg";
+      cb(null, `avatar-${Date.now()}${ext}`);
+    }),
+  limits: { fileSize: 2 * 1024 * 1024 },
+  fileFilter: (_req, file, cb) => {
+    const allowed = ["image/jpeg", "image/jpg", "image/png", "image/webp"];
+    cb(null, allowed.includes(file.mimetype));
+  },
+});
+
+function mapValidatedToDb(normalized, body) {
+  const fn = String(body.firstName || normalized.firstName || "").trim();
+  const ln = String(body.lastName || normalized.lastName || "").trim();
+  const fullName = String(body.fullName || body.name || "").trim();
+  const composedName = fullName || [fn, ln].filter(Boolean).join(" ").trim();
+
+  return {
+    full_name: composedName,
+    phone: normalized.phoneNumber || "",
+    username: normalized.username,
+    date_of_birth: normalized.dateOfBirth || null,
+    gender: normalized.gender,
+    country: normalized.country,
+    language: normalized.language,
+    bio: normalized.bio,
+    preferences:
+      body.preferences !== undefined ? parsePreferences(body.preferences) : undefined,
+  };
+}
+
+async function handleGetProfile(req, res) {
+  try {
+    const userId = req.userId;
+    if (!userId) {
+      return res.status(401).json({ success: false, message: "User id is required." });
+    }
+
+    const profile = await getProfileForUser(userId, { ensureProfile: true });
+    if (!profile) {
+      return res.status(404).json({ success: false, message: "Profile not found." });
+    }
+
+    return res.json({ success: true, user: profile });
+  } catch (error) {
+    console.error("Get profile failed. SQL Error:", error.message || error);
+    return res.status(500).json({ 
+      success: false, 
+      message: "Internal Server Error during profile fetch.",
+      error: error.message || String(error)
+    });
+  }
+}
+
+async function handleUpdateProfile(req, res, { partial = false } = {}) {
+  try {
+    const userId = req.userId;
+    if (!userId) {
+      return res.status(401).json({ success: false, message: "User id is required." });
+    }
+
+    if (isPhoneOnlyProfileUpdate(req.body)) {
+      const { errors, normalized } = validatePhoneUpdatePayload(req.body);
+      if (Object.keys(errors).length) {
+        return res.status(400).json({ success: false, message: "Validation failed.", errors });
+      }
+      const updated = await updateUserProfile(userId, {
+        phone: normalized.phoneNumber,
+      });
+      return res.json({ success: true, user: updated });
+    }
+
+    const { errors, normalized } = validateProfilePayload(req.body, { partial });
+    if (Object.keys(errors).length) {
+      return res.status(400).json({ success: false, message: "Validation failed.", errors });
+    }
+
+    const dbPayload = mapValidatedToDb(normalized, req.body);
+    if (req.body.avatarUrl !== undefined) {
+      dbPayload.avatar_url = req.body.avatarUrl;
+    }
+
+    const updated = await updateUserProfile(userId, dbPayload);
+    if (!updated) {
+      return res.status(404).json({ success: false, message: "Profile not found." });
+    }
+
+    return res.json({ success: true, user: updated });
+  } catch (error) {
+    console.error("Update profile failed:", error);
+    return res.status(500).json({ success: false, message: "Could not update profile." });
+  }
+}
+
+async function handleGetPayments(req, res) {
+  try {
+    const userId = req.userId;
+    if (!userId) {
+      return res.status(401).json({ success: false, message: "User id is required." });
+    }
+
+    const query = `
+      SELECT 
+        p.payment_id,
+        p.amount_paid,
+        p.change_given,
+        p.payment_status,
+        p.transaction_ref,
+        p.paid_at,
+        p.created_at,
+        p.payment_method_id,
+        o.order_id,
+        o.order_type,
+        r.reservation_id,
+        CASE
+          WHEN p.order_id IS NOT NULL AND o.order_type = 'Preorder' THEN 'Pre-ordered Items'
+          WHEN p.order_id IS NOT NULL THEN 'Dine-In Order'
+          WHEN p.reservation_id IS NOT NULL THEN 'Reservation Booking'
+          ELSE 'Other Payment'
+        END AS payment_purpose
+      FROM dbo.Payments p
+      LEFT JOIN dbo.Orders o ON p.order_id = o.order_id
+      LEFT JOIN dbo.Reservations r ON p.reservation_id = r.reservation_id
+      WHERE o.customer_id = ? OR r.customer_id = ?
+      ORDER BY COALESCE(p.paid_at, p.created_at) DESC
+    `;
+
+    const [payments] = await pool.query(query, [userId, userId]);
+    return res.json({ success: true, payments });
+  } catch (error) {
+    console.error("Get payments failed:", error);
+    return res.status(500).json({ success: false, message: "Could not fetch payment history." });
+  }
+}
+
+router.get("/me", resolveUserId, requireUserId, handleGetProfile);
+router.put("/me", resolveUserId, requireUserId, (req, res) => handleUpdateProfile(req, res));
+router.get("/me/payments", resolveUserId, requireUserId, handleGetPayments);
+router.get("/:userId", resolveUserId, handleGetProfile);
+router.put("/:userId", resolveUserId, (req, res) => handleUpdateProfile(req, res));
+router.get("/:userId/payments", resolveUserId, handleGetPayments);
+router.patch("/:userId", resolveUserId, (req, res) =>
+  handleUpdateProfile(req, res, { partial: true })
+);
+
+router.post("/:userId/avatar/upload", resolveUserId, upload.single("avatar"), async (req, res) => {
+  try {
+    const userId = req.userId;
+    if (!userId || !req.file) {
+      return res.status(400).json({ success: false, message: "Avatar file is required." });
+    }
+
+    const avatarUrl = await persistUpload(req.file,"avatars");
+    const updated = await updateUserProfile(userId, { avatar_url: avatarUrl });
+
+    return res.json({
+      success: true,
+      avatarUrl,
+      user: updated,
+    });
+  } catch (error) {
+    console.error("Avatar upload failed:", error);
+    return res.status(500).json({ success: false, message: "Avatar upload failed." });
+  }
+});
+
+router.put("/:userId/avatar/system", resolveUserId, async (req, res) => {
+  try {
+    const userId = req.userId;
+    const avatarUrl = String(req.body?.avatarUrl || "").trim();
+    if (!userId || !avatarUrl) {
+      return res.status(400).json({ success: false, message: "Avatar url is required." });
+    }
+
+    const updated = await updateUserProfile(userId, { avatar_url: avatarUrl });
+    return res.json({ success: true, avatarUrl, user: updated });
+  } catch (error) {
+    console.error("System avatar update failed:", error);
+    return res.status(500).json({ success: false, message: "Avatar update failed." });
+  }
+});
+
+router.put("/:userId/avatar/google", resolveUserId, async (req, res) => {
+  try {
+    const userId = req.userId;
+    if (!userId) {
+      return res.status(400).json({ success: false, message: "User id is required." });
+    }
+
+    const [rows] = await pool.query(
+      `SELECT avatar_url FROM dbo.UserAccounts WHERE user_id = ?`,
+      [userId]
+    );
+    const current = rows[0]?.avatar_url;
+    if (!current) {
+      return res.status(400).json({
+        success: false,
+        message: "No Google avatar is stored for this account.",
+      });
+    }
+
+    return res.json({
+      success: true,
+      avatarUrl: current,
+      user: await getProfileForUser(userId, { ensureProfile: true }),
+    });
+  } catch (error) {
+    console.error("Google avatar update failed:", error);
+    return res.status(500).json({ success: false, message: "Avatar update failed." });
+  }
+});
+
+export default router;
