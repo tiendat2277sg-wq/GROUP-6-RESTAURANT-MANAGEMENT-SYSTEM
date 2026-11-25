@@ -1,0 +1,997 @@
+import { query, withTransaction } from '../config/db.js';
+import { saveNotification, TYPE } from '../services/notification.service.js';
+import { writeAudit, ACTION } from '../services/audit.service.js';
+import { createError } from '../middleware/errorHandler.js';
+import { getCustomerBalance } from '../services/loyaltyService.js';
+
+import { RESERVATION_STATUS } from '../constants/reservationStatus.js';
+import { assertItemsAllowedForTables, PolicyError, sendPolicyError } from '../utils/areaDishPolicy.js';
+
+export async function submitReservation(req, res, next) {
+  try {
+    const customerId = req.user.user_id;
+    const {
+      preferred_area_id,
+      table_id,
+      reservation_start_at,
+      reservation_end_at,
+      guest_count,
+      special_request,
+      dining_purpose,
+      hold_time,
+      preorder_items = [],
+      promo_code,
+      // Guest contact fields — always stored directly in dbo.Reservations
+      // so data is never lost regardless of whether the user is authenticated.
+      guest_name,
+      guest_phone,
+      guest_email,
+    } = req.body;
+
+    const errors = [];
+    if (!reservation_start_at) errors.push('reservation_start_at is required.');
+    if (!reservation_end_at) errors.push('reservation_end_at is required.');
+    if (!guest_count) errors.push('guest_count is required.');
+    if (errors.length > 0) return res.status(400).json({ errors });
+
+    const startAt = new Date(reservation_start_at);
+    const endAt = new Date(reservation_end_at);
+
+    if (isNaN(startAt.getTime())) return res.status(400).json({ error: 'reservation_start_at is not a valid date.' });
+    if (isNaN(endAt.getTime())) return res.status(400).json({ error: 'reservation_end_at is not a valid date.' });
+    if (endAt <= startAt) return res.status(400).json({ error: 'reservation_end_at must be after reservation_start_at.' });
+    if (startAt <= new Date()) return res.status(400).json({ error: 'Reservation must be scheduled in the future.' });
+
+    const guestNum = parseInt(guest_count, 10);
+    if (isNaN(guestNum) || guestNum < 1 || guestNum > 12) {
+      return res.status(400).json({ error: 'guest_count must be between 1 and 12.' });
+    }
+
+    let resolvedPromo = null;
+    if (promo_code && String(promo_code).trim() !== '') {
+      const vRows = await query(
+        `SELECT v.promo_code_id, p.promotion_name, p.discount_type, p.discount_value
+         FROM dbo.PromoCodes v
+         JOIN dbo.Promotions p ON v.promotion_id = p.promotion_id
+         WHERE v.promo_code  = @Code
+           AND v.is_active     = 1
+           AND p.is_active     = 1
+           AND v.times_used    < v.usage_limit
+           AND p.start_at     <= SYSDATETIME()
+           AND p.end_at       >= SYSDATETIME()`,
+        { Code: promo_code.trim() }
+      );
+      if (vRows.length === 0) {
+        return res.status(400).json({ error: `Promo code "${promo_code}" is invalid, expired, or fully used.` });
+      }
+      resolvedPromo = vRows[0];
+    }
+
+    const enrichedPreorders = [];
+    for (const item of preorder_items) {
+      if (!item.dish_id || !item.quantity || item.quantity < 1) {
+        return res.status(400).json({ error: `Invalid preorder item: ${JSON.stringify(item)}` });
+      }
+      const dRows = await query(
+        `SELECT dish_id, price FROM dbo.Dishes
+         WHERE dish_id = @DishId AND is_available = 1 AND allow_preorder = 1`,
+        { DishId: Number(item.dish_id) }
+      );
+      if (dRows.length === 0) {
+        return res.status(400).json({
+          error: `Dish ID ${item.dish_id} is not available for preorder.`
+        });
+      }
+      enrichedPreorders.push({ ...item, unit_price: dRows[0].price });
+    }
+
+    try {
+      // This legacy customer endpoint shares the same seating policy as the
+      // reservation wizard. No selected table means an Omakase set is not eligible.
+      await assertItemsAllowedForTables(
+        table_id ? [Number(table_id)] : [],
+        enrichedPreorders.map((item) => item.dish_id),
+      );
+    } catch (policyError) {
+      if (policyError instanceof PolicyError) return sendPolicyError(res, policyError);
+      throw policyError;
+    }
+
+    const { reservationId } = await withTransaction(async (tx) => {
+      // ── STEP 0: Time-based table conflict check (Option B) ──────────────────
+      // If a specific table was requested, ensure no overlapping confirmed booking exists.
+      if (table_id) {
+        const conflictRows = await tx(
+          `SELECT r.reservation_id
+           FROM dbo.Reservations r
+           JOIN dbo.ReservationTables rt ON rt.reservation_id = r.reservation_id
+           WHERE rt.table_id = @Tid
+             AND r.reservation_status NOT IN (N'Completed', N'Paid', N'Cancelled', N'No Show')
+             AND DATEADD(minute, -60, r.reservation_start_at) < @EndAt
+             AND DATEADD(minute, 60, r.reservation_end_at)   > @StartAt`,
+          { Tid: Number(table_id), StartAt: startAt, EndAt: endAt }
+        );
+        if (conflictRows.length > 0) {
+          throw createError(409,
+            `Table ${table_id} is already booked during ${startAt.toLocaleString('vi-VN')} – ${endAt.toLocaleString('vi-VN')}. Please choose a different table or time.`
+          );
+        }
+      }
+
+      // Format special_request to embed dining purpose and hold time
+      const finalPurpose = dining_purpose || null;
+      const finalSpecialRequest = special_request ? special_request.trim() : null;
+
+      // ── STEP 1: Insert reservation — status Confirmed immediately ────────────
+      // Rule: Do NOT use OUTPUT INSERTED.* on tables that have DB triggers.
+      // Safe pattern: INSERT first, then SELECT SCOPE_IDENTITY() for the new PK.
+      await tx(
+        `INSERT INTO dbo.Reservations
+           (customer_id, preferred_area_id,
+            reservation_start_at, reservation_end_at,
+            guest_count, special_request, dining_purpose,
+            contact_name, contact_phone, contact_email,
+            reservation_status, reservation_source,
+            confirmed_at,
+            created_at, updated_at)
+         VALUES
+           (@CustId, @AreaId,
+            @StartAt, @EndAt,
+            @Guests, @Request, @DiningPurpose,
+            @GuestName, @GuestPhone, @GuestEmail,
+            N'Awaiting Deposit', N'Online',
+            SYSDATETIME(),
+            SYSDATETIME(), SYSDATETIME())`,
+        {
+          CustId: customerId,
+          AreaId: preferred_area_id ? Number(preferred_area_id) : null,
+          StartAt: startAt,
+          EndAt: endAt,
+          Guests: guestNum,
+          Request: finalSpecialRequest || null,
+          DiningPurpose: finalPurpose || null,
+          GuestName: guest_name || null,
+          GuestPhone: guest_phone || null,
+          GuestEmail: guest_email || null,
+        }
+      );
+
+      // Fetch the new reservation_id safely after insert
+      const idRows = await tx(`SELECT SCOPE_IDENTITY() AS reservation_id`);
+      const reservationId = idRows[0]?.reservation_id;
+      if (!reservationId) throw new Error('Failed to retrieve new reservation_id after INSERT.');
+
+      // ── STEP 2: Assign & reserve the table immediately ───────────────────────
+      let finalTableId = table_id ? Number(table_id) : null;
+      if (!finalTableId) {
+        const autoRes = await tx(
+          `SELECT TOP 1 table_id FROM dbo.RestaurantTables WITH (UPDLOCK, ROWLOCK)
+           WHERE table_status = N'Available' AND capacity >= @GuestCount
+             AND area_id NOT IN (SELECT area_id FROM dbo.RestaurantAreas WHERE area_name LIKE N'%omakase%')
+           ORDER BY capacity ASC`,
+          { GuestCount: guestNum }
+        );
+        if (autoRes.length > 0) {
+          finalTableId = autoRes[0].table_id;
+        }
+      }
+
+      if (finalTableId) {
+        const tRows = await tx(
+          `SELECT table_id FROM dbo.RestaurantTables WHERE table_id = @Tid`,
+          { Tid: finalTableId }
+        );
+        if (tRows.length === 0) {
+          throw createError(400, `Table ID ${finalTableId} does not exist.`);
+        }
+        await tx(
+          `INSERT INTO dbo.ReservationTables
+             (reservation_id, table_id, assigned_by_staff_id, assigned_at)
+           VALUES (@ResId, @Tid, NULL, SYSDATETIME())`,
+          { ResId: reservationId, Tid: finalTableId }
+        );
+        // Mark the table as Reserved so it does not appear available in the map
+        await tx(
+          `UPDATE dbo.RestaurantTables
+           SET table_status = N'Reserved', updated_at = SYSDATETIME()
+           WHERE table_id = @Tid`,
+          { Tid: finalTableId }
+        );
+      }
+
+      // ── STEP 3: Pre-order items ───────────────────────────────────────────────
+      for (const item of enrichedPreorders) {
+        await tx(
+          `INSERT INTO dbo.PreorderItems
+             (reservation_id, dish_id, quantity, unit_price, notes, created_at)
+           VALUES (@ResId, @DishId, @Qty, @Price, @Notes, SYSDATETIME())`,
+          {
+            ResId: reservationId,
+            DishId: Number(item.dish_id),
+            Qty: Number(item.quantity),
+            Price: parseFloat(item.unit_price),
+            Notes: item.notes || null,
+          }
+        );
+      }
+
+      // ── STEP 4: Notify Manager & Staff (informational, not approval needed) ──
+      const allStaff = await tx(
+        `SELECT user_id FROM dbo.UserAccounts WHERE role_id IN (2, 4) AND is_active = 1`
+      );
+      for (const s of allStaff) {
+        await saveNotification(tx, {
+          userId: s.user_id,
+          type: TYPE.SYSTEM,
+          title: 'New Reservation — Auto-Confirmed',
+          body:
+            `Reservation #${reservationId} from Customer ID ${customerId} is created and awaiting payment. ` +
+            `${guestNum} guests · ${startAt.toLocaleString('en-GB')}` +
+            (enrichedPreorders.length > 0 ? ` · ${enrichedPreorders.length} pre-order item(s)` : '') +
+            (resolvedPromo ? ` · Promo Code: ${promo_code}` : '') +
+            `. Pending 15m timeout.`,
+        });
+      }
+
+      // ── STEP 5: Audit Log ─────────────────────────────────────────────────────
+      await writeAudit(tx, {
+        userId: customerId,
+        action: ACTION.RESERVATION_CREATED,
+        table: 'Reservations',
+        targetId: reservationId,
+        newValue: {
+          reservation_id: reservationId,
+          status: 'Awaiting Deposit',
+          customer_id: customerId,
+          start_at: startAt.toISOString(),
+          guest_count: guestNum,
+          table_id: table_id || null,
+          preorder_count: enrichedPreorders.length,
+          promo_code: promo_code || null,
+          auto_confirmed: true,
+        },
+        ip: req.ip,
+      });
+
+      return { reservationId, finalTableId };
+    });
+
+    // ── Socket.IO broadcast ───────────────────────────────────────────────────
+    const io = req.app.get('io');
+    if (io) {
+      io.to('room:manager').to('room:staff').emit('reservation:new', {
+        reservation_id: reservationId,
+        reservation_status: RESERVATION_STATUS.AWAITING_DEPOSIT,
+        customer_id: customerId,
+        reservation_start_at: startAt.toISOString(),
+        guest_count: guestNum,
+        preferred_area_id: preferred_area_id || null,
+        table_id: table_id || null,
+        has_preorder: enrichedPreorders.length > 0,
+        has_promo: !!resolvedPromo,
+        dining_purpose: dining_purpose || null,
+      });
+    }
+
+    // ── 15-Minute Payment Timeout ─────────────────────────────────────────────
+    setTimeout(async () => {
+      try {
+        // Check current status
+        const rows = await query(
+          `SELECT reservation_status FROM dbo.Reservations WHERE reservation_id = @ResId`,
+          { ResId: reservationId }
+        );
+        if (rows && rows.length > 0 && rows[0].reservation_status === RESERVATION_STATUS.PENDING_PAYMENT) {
+          // Cancel it
+          await query(
+            `UPDATE dbo.Reservations SET reservation_status = @Status, updated_at = SYSDATETIME() WHERE reservation_id = @ResId`,
+            { Status: RESERVATION_STATUS.CANCELLED, ResId: reservationId }
+          );
+
+          // Free the table
+          if (finalTableId) {
+            await query(
+              `UPDATE dbo.RestaurantTables SET table_status = N'Available', updated_at = SYSDATETIME() WHERE table_id = @Tid`,
+              { Tid: finalTableId }
+            );
+          }
+
+          // Broadcast cancellation
+          if (io) {
+            io.to('room:manager').to('room:staff').emit('reservation:updated', {
+              reservation_id: reservationId,
+              reservation_status: RESERVATION_STATUS.CANCELLED
+            });
+            if (finalTableId) {
+              io.to('room:manager').to('room:staff').emit('table:status_updated', {
+                table_id: finalTableId,
+                status: 'Available'
+              });
+            }
+          }
+          console.log(`[TIMEOUT] Reservation ${reservationId} cancelled due to unpaid timeout. Table ${finalTableId} freed.`);
+        }
+      } catch (e) {
+        console.error(`[TIMEOUT ERROR] Failed to auto-cancel reservation ${reservationId}:`, e);
+      }
+    }, 15 * 60 * 1000);
+
+    return res.status(201).json({
+      success: true,
+      reservation_id: reservationId,
+      reservation_status: RESERVATION_STATUS.PENDING_PAYMENT,
+      message: 'Reservation created. Please complete payment within 15 minutes to hold your table.',
+    });
+
+  } catch (err) { next(err); }
+}
+
+export const getCustomerPaymentHistory = async (req, res) => {
+  try {
+    const userId = req.userId || req.user?.id || req.user?.user_id;
+
+    if (!userId) {
+      return res.status(401).json({ success: false, message: "User not authenticated." });
+    }
+
+    const queryStr = `
+            SELECT 
+                p.payment_id, p.amount_paid, p.payment_status, p.paid_at, p.transaction_ref, p.created_at,
+                pm.method_name,
+                CASE 
+                    WHEN p.order_id IS NOT NULL THEN 'Order Payment'
+                    WHEN p.reservation_id IS NOT NULL THEN 'Reservation Deposit'
+                    ELSE 'Payment'
+                END AS payment_purpose,
+                o.order_id, o.order_type,
+                r.reservation_id, r.reservation_start_at
+            FROM dbo.Payments p
+            LEFT JOIN dbo.PaymentMethods pm ON p.payment_method_id = pm.payment_method_id
+            LEFT JOIN dbo.Orders o ON p.order_id = o.order_id
+            LEFT JOIN dbo.Reservations r ON p.reservation_id = r.reservation_id
+            WHERE o.customer_id = @userId OR r.customer_id = @userId
+            ORDER BY p.created_at DESC;
+        `;
+
+    const result = await query(queryStr, { userId });
+
+    return res.json({ success: true, payments: result || [] });
+  } catch (err) {
+    console.error('Error fetching customer payment history:', err);
+    res.status(500).json({ success: false, message: 'Internal server error.' });
+  }
+};
+
+export const getCustomerPaymentDetails = async (req, res) => {
+  try {
+    const userId = req.userId || req.user?.id || req.user?.user_id;
+    const { paymentId } = req.params;
+
+    if (!userId) {
+      return res.status(401).json({ success: false, message: "User not authenticated." });
+    }
+
+    const paymentQuery = `
+            SELECT 
+                p.payment_id, p.amount_paid, p.change_given, p.payment_status, p.paid_at, p.transaction_ref, p.created_at,
+                pm.method_name,
+                o.order_id, o.order_status, o.subtotal AS total_amount, o.service_charge AS tax_amount, o.discount_amount, o.total_amount AS net_amount, o.order_type,
+                r.reservation_id, r.reservation_status, r.reservation_start_at, r.guest_count, r.special_request, r.dining_purpose,
+                t.table_number, t.capacity AS seating_capacity
+            FROM dbo.Payments p
+            LEFT JOIN dbo.PaymentMethods pm ON p.payment_method_id = pm.payment_method_id
+            LEFT JOIN dbo.Orders o ON p.order_id = o.order_id
+            LEFT JOIN dbo.Reservations r ON p.reservation_id = r.reservation_id
+            OUTER APPLY (
+                SELECT TOP 1 rt.table_id 
+                FROM dbo.ReservationTables rt 
+                WHERE rt.reservation_id = r.reservation_id
+            ) rt_join
+            LEFT JOIN dbo.RestaurantTables t ON t.table_id = COALESCE(o.table_id, rt_join.table_id)
+            WHERE p.payment_id = @paymentId AND (o.customer_id = @userId OR r.customer_id = @userId)
+        `;
+    const payments = await query(paymentQuery, { paymentId, userId });
+
+    if (!payments || payments.length === 0) {
+      return res.status(404).json({ success: false, message: "Payment not found or unauthorized." });
+    }
+
+    const payment = payments[0];
+    let items = [];
+
+    if (payment.order_id) {
+      const itemsQuery = `
+                SELECT 
+                    oi.order_item_id, oi.quantity, oi.unit_price, oi.line_total AS subtotal, oi.notes AS note,
+                    d.dish_name AS item_name,
+                    CONCAT('/api/dishes/', d.dish_id, '/image') AS image_url
+                FROM dbo.OrderItems oi
+                JOIN dbo.Dishes d ON oi.dish_id = d.dish_id
+                WHERE oi.order_id = @orderId
+            `;
+      items = await query(itemsQuery, { orderId: payment.order_id });
+    }
+
+    return res.json({ success: true, payment, items });
+  } catch (err) {
+    console.error('Error fetching payment details:', err);
+    res.status(500).json({ success: false, message: 'Internal server error.' });
+  }
+};
+
+export const getCustomerDashboardSummary = async (req, res) => {
+  try {
+    const userId = req.userId || req.user?.id || req.user?.user_id;
+    if (!userId) return res.status(401).json({ success: false, message: "Unauthorized." });
+
+    const { startDate, endDate } = req.query;
+    let startVal = startDate ? new Date(startDate) : null;
+    let endVal = endDate ? new Date(endDate) : null;
+    if (startVal && isNaN(startVal.getTime())) startVal = null;
+    if (endVal && isNaN(endVal.getTime())) endVal = null;
+
+    let dateFilter = "";
+    let prevDateFilter = "";
+    let prevStartVal = null;
+    let prevEndVal = null;
+
+    if (startVal && endVal) {
+      dateFilter = " AND created_at >= @startDate AND created_at <= @endDate ";
+      prevDateFilter = " AND created_at >= @prevStartDate AND created_at <= @prevEndDate ";
+
+      const diffMs = endVal.getTime() - startVal.getTime();
+      prevStartVal = new Date(startVal.getTime() - diffMs);
+      prevEndVal = new Date(endVal.getTime() - diffMs);
+    } else {
+      prevDateFilter = " AND created_at < DATEADD(day, -30, GETDATE()) ";
+    }
+
+    // 1. Total Reservations
+    const resQuery = `SELECT COUNT(*) AS total FROM dbo.Reservations WHERE customer_id = @userId AND reservation_status != N'Cancelled' ${dateFilter}`;
+    const resPrevQuery = `SELECT COUNT(*) AS total FROM dbo.Reservations WHERE customer_id = @userId AND reservation_status != N'Cancelled' ${prevDateFilter}`;
+
+    let sparkEndDate = endVal || new Date();
+    const resSparkQuery = `SELECT CAST(created_at AS DATE) as date, COUNT(*) as count FROM dbo.Reservations WHERE customer_id = @userId AND reservation_status != N'Cancelled' AND created_at >= DATEADD(day, -7, @sparkEndDate) AND created_at <= @sparkEndDate GROUP BY CAST(created_at AS DATE) ORDER BY date ASC`;
+
+    // 2. Total Orders
+    const ordQuery = `SELECT COUNT(*) AS total FROM dbo.Orders WHERE customer_id = @userId ${dateFilter}`;
+    const ordPrevQuery = `SELECT COUNT(*) AS total FROM dbo.Orders WHERE customer_id = @userId ${prevDateFilter}`;
+    const ordSparkQuery = `SELECT CAST(created_at AS DATE) as date, COUNT(*) as count FROM dbo.Orders WHERE customer_id = @userId AND created_at >= DATEADD(day, -7, @sparkEndDate) AND created_at <= @sparkEndDate GROUP BY CAST(created_at AS DATE) ORDER BY date ASC`;
+
+    // 3. Total Expenditure
+    let pDateFilter = "";
+    let pPrevDateFilter = "";
+    if (startVal && endVal) {
+      pDateFilter = " AND p.created_at >= @startDate AND p.created_at <= @endDate ";
+      pPrevDateFilter = " AND p.created_at >= @prevStartDate AND p.created_at <= @prevEndDate ";
+    } else {
+      pPrevDateFilter = " AND p.created_at < DATEADD(day, -30, GETDATE()) ";
+    }
+    const expQuery = `SELECT SUM(p.amount_paid) AS total FROM dbo.Payments p LEFT JOIN dbo.Orders o ON p.order_id = o.order_id LEFT JOIN dbo.Reservations r ON p.reservation_id = r.reservation_id WHERE p.payment_status = N'Completed' AND (o.customer_id = @userId OR r.customer_id = @userId) ${pDateFilter}`;
+    const expPrevQuery = `SELECT SUM(p.amount_paid) AS total FROM dbo.Payments p LEFT JOIN dbo.Orders o ON p.order_id = o.order_id LEFT JOIN dbo.Reservations r ON p.reservation_id = r.reservation_id WHERE p.payment_status = N'Completed' AND (o.customer_id = @userId OR r.customer_id = @userId) ${pPrevDateFilter}`;
+    const expSparkQuery = `SELECT CAST(p.created_at AS DATE) as date, SUM(p.amount_paid) as count FROM dbo.Payments p LEFT JOIN dbo.Orders o ON p.order_id = o.order_id LEFT JOIN dbo.Reservations r ON p.reservation_id = r.reservation_id WHERE p.payment_status = N'Completed' AND (o.customer_id = @userId OR r.customer_id = @userId) AND p.created_at >= DATEADD(day, -7, @sparkEndDate) AND p.created_at <= @sparkEndDate GROUP BY CAST(p.created_at AS DATE) ORDER BY date ASC`;
+
+    const safeQuery = async (q, params) => {
+      try {
+        return await query(q, params);
+      } catch (err) {
+        console.error(`[Dashboard] Query failed: ${q.substring(0, 50)}...`, err.message || err);
+        return [];
+      }
+    };
+
+    const queryParams = {
+      userId,
+      startDate: startVal,
+      endDate: endVal,
+      prevStartDate: prevStartVal,
+      prevEndDate: prevEndVal,
+      sparkEndDate
+    };
+
+    const [
+      reservations, prevReservations, resSpark,
+      orders, prevOrders, ordSpark,
+      expenditures, prevExpenditures, expSpark
+    ] = await Promise.all([
+      safeQuery(resQuery, queryParams), safeQuery(resPrevQuery, queryParams), safeQuery(resSparkQuery, queryParams),
+      safeQuery(ordQuery, queryParams), safeQuery(ordPrevQuery, queryParams), safeQuery(ordSparkQuery, queryParams),
+      safeQuery(expQuery, queryParams), safeQuery(expPrevQuery, queryParams), safeQuery(expSparkQuery, queryParams)
+    ]);
+
+    const loyaltyBalanceData = await getCustomerBalance(userId);
+    const totalLoyaltyPoints = loyaltyBalanceData.balance || 0;
+
+    const calcDelta = (curr, prev) => {
+      let res;
+      if (!prev || prev === 0) {
+        if (!curr || curr === 0) res = 0;
+        else res = 100;
+      } else {
+        res = ((curr - prev) / prev) * 100;
+      }
+      console.log(`calcDelta: curr=${curr}, prev=${prev}, res=${res}`);
+      return res;
+    };
+
+    const generateSparklineArray = (data) => {
+      const arr = Array(7).fill(0);
+      const targetEnd = new Date(sparkEndDate);
+      targetEnd.setHours(0, 0, 0, 0);
+      if (data && data.length > 0) {
+        data.forEach(row => {
+          const d = new Date(row.date);
+          d.setHours(0, 0, 0, 0);
+          const diffTime = Math.abs(targetEnd - d);
+          const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
+          if (diffDays < 7) {
+            arr[6 - diffDays] = row.count || 0;
+          }
+        });
+      }
+      return arr;
+    };
+
+    const totalReservations = reservations[0]?.total || 0;
+    const totalOrders = orders[0]?.total || 0;
+    const totalExpenditure = expenditures[0]?.total || 0;
+
+    return res.json({
+      totalReservations: {
+        value: totalReservations,
+        deltaPercent: calcDelta(totalReservations, prevReservations[0]?.total || 0),
+        sparkline: generateSparklineArray(resSpark)
+      },
+      totalOrders: {
+        value: totalOrders,
+        deltaPercent: calcDelta(totalOrders, prevOrders[0]?.total || 0),
+        sparkline: generateSparklineArray(ordSpark)
+      },
+      totalExpenditure: {
+        value: totalExpenditure,
+        deltaPercent: calcDelta(totalExpenditure, prevExpenditures[0]?.total || 0),
+        sparkline: generateSparklineArray(expSpark)
+      },
+      totalLoyaltyPoints: {
+        value: totalLoyaltyPoints,
+        deltaPercent: null,
+        sparkline: []
+      }
+    });
+  } catch (err) {
+    console.error('Error fetching dashboard summary:', err);
+    res.status(500).json({ success: false, message: 'Internal server error.' });
+  }
+};
+
+export const getCustomerExpenditureTrend = async (req, res) => {
+  try {
+    const userId = req.userId || req.user?.id || req.user?.user_id;
+    const { range = '6m', startDate, endDate } = req.query;
+    if (!userId) return res.status(401).json({ success: false, message: "Unauthorized." });
+
+    let monthsBack = 6;
+    if (range === '1y') monthsBack = 12;
+
+    let startVal = startDate ? new Date(startDate) : null;
+    let endVal = endDate ? new Date(endDate) : null;
+    if (startVal && isNaN(startVal.getTime())) startVal = null;
+    if (endVal && isNaN(endVal.getTime())) endVal = null;
+
+    let dateFilter = "";
+    let grouping = "yyyy-MM";
+
+    if (startVal && endVal) {
+      dateFilter = " AND p.created_at >= @startDate AND p.created_at <= @endDate ";
+
+      const diffDays = Math.ceil(Math.abs(endVal - startVal) / (1000 * 60 * 60 * 24));
+      if (diffDays <= 1) {
+        grouping = "HH:00";
+      } else if (diffDays <= 31) {
+        grouping = "yyyy-MM-dd";
+      }
+    } else {
+      dateFilter = " AND p.created_at >= DATEADD(month, -@monthsBack, GETDATE()) ";
+    }
+
+    const trendQuery = `
+            SELECT 
+                FORMAT(p.created_at, '${grouping}') AS month,
+                SUM(p.amount_paid) AS total
+            FROM dbo.Payments p
+            LEFT JOIN dbo.Orders o ON p.order_id = o.order_id
+            LEFT JOIN dbo.Reservations r ON p.reservation_id = r.reservation_id
+            WHERE p.payment_status = N'Completed' 
+              AND (o.customer_id = @userId OR r.customer_id = @userId)
+              ${dateFilter}
+            GROUP BY FORMAT(p.created_at, '${grouping}')
+            ORDER BY month ASC
+        `;
+
+    let result = [];
+    try {
+      result = await query(trendQuery, { userId, monthsBack, startDate: startVal, endDate: endVal });
+    } catch (err) {
+      console.error('[Dashboard] Expenditure Trend Query failed:', err.message || err);
+    }
+    return res.json({ success: true, trend: result || [] });
+  } catch (err) {
+    console.error('Error fetching expenditure trend:', err);
+    res.status(500).json({ success: false, message: 'Internal server error.' });
+  }
+};
+
+export const getCustomerOrdersByCategory = async (req, res) => {
+  try {
+    const userId = req.userId || req.user?.id || req.user?.user_id;
+    if (!userId) return res.status(401).json({ success: false, message: "Unauthorized." });
+
+    const { startDate, endDate } = req.query;
+    let startVal = startDate ? new Date(startDate) : null;
+    let endVal = endDate ? new Date(endDate) : null;
+    if (startVal && isNaN(startVal.getTime())) startVal = null;
+    if (endVal && isNaN(endVal.getTime())) endVal = null;
+
+    let dateFilter = "";
+    if (startVal && endVal) {
+      dateFilter = " AND o.created_at >= @startDate AND o.created_at <= @endDate ";
+    }
+
+    const catQuery = `
+            SELECT 
+                mc.category_name as category,
+                COUNT(oi.order_item_id) as count
+            FROM dbo.OrderItems oi
+            JOIN dbo.Orders o ON oi.order_id = o.order_id
+            JOIN dbo.Dishes d ON oi.dish_id = d.dish_id
+            JOIN dbo.MenuCategories mc ON d.category_id = mc.category_id
+            WHERE o.customer_id = @userId ${dateFilter}
+            GROUP BY mc.category_name
+            ORDER BY count DESC
+        `;
+    let result = [];
+    try {
+      result = await query(catQuery, { userId, startDate: startVal, endDate: endVal });
+    } catch (err) {
+      // Silently fallback to avoid terminal spam
+    }
+
+    return res.json({ success: true, categories: result || [] });
+  } catch (err) {
+    console.error('Error fetching categories:', err);
+    res.status(500).json({ success: false, message: 'Internal server error.' });
+  }
+};
+
+export const getCustomerDetailedOrderItems = async (req, res) => {
+  try {
+    const userId = req.userId || req.user?.id || req.user?.user_id;
+    if (!userId) return res.status(401).json({ success: false, message: "Unauthorized." });
+
+    const { startDate, endDate } = req.query;
+    let startVal = startDate ? new Date(startDate) : null;
+    let endVal = endDate ? new Date(endDate) : null;
+    if (startVal && isNaN(startVal.getTime())) startVal = null;
+    if (endVal && isNaN(endVal.getTime())) endVal = null;
+
+    let orderDateFilter = "";
+    let resDateFilter = "";
+    if (startVal && endVal) {
+      orderDateFilter = " AND o.created_at >= @startDate AND o.created_at <= @endDate ";
+      resDateFilter = " AND r.created_at >= @startDate AND r.created_at <= @endDate ";
+    }
+
+    const itemQuery = `
+      SELECT 
+        dish_name,
+        dish_id,
+        category_name,
+        SUM(quantity) as quantity,
+        AVG(unit_price) as unit_price,
+        SUM(subtotal) as subtotal,
+        MAX(image_url) as image_url
+      FROM (
+        SELECT 
+          d.dish_name,
+          d.dish_id,
+          mc.category_name,
+          oi.quantity,
+          oi.unit_price,
+          oi.line_total as subtotal,
+          CONCAT('/api/dishes/', d.dish_id, '/image') AS image_url
+        FROM dbo.OrderItems oi
+        JOIN dbo.Orders o ON oi.order_id = o.order_id
+        JOIN dbo.Dishes d ON oi.dish_id = d.dish_id
+        JOIN dbo.MenuCategories mc ON d.category_id = mc.category_id
+        WHERE o.customer_id = @userId AND oi.item_status != N'Cancelled'
+          ${orderDateFilter}
+        
+        UNION ALL
+        
+        SELECT 
+          d.dish_name,
+          d.dish_id,
+          mc.category_name,
+          pi.quantity,
+          pi.unit_price,
+          (pi.quantity * pi.unit_price) as subtotal,
+          CONCAT('/api/dishes/', d.dish_id, '/image') AS image_url
+        FROM dbo.PreorderItems pi
+        JOIN dbo.Reservations r ON pi.reservation_id = r.reservation_id
+        JOIN dbo.Dishes d ON pi.dish_id = d.dish_id
+        JOIN dbo.MenuCategories mc ON d.category_id = mc.category_id
+        WHERE r.customer_id = @userId 
+          AND r.reservation_status IN (N'Await Check-in', N'Dining', N'Completed')
+          ${resDateFilter}
+      ) AS Combined
+      GROUP BY dish_name, dish_id, category_name
+      ORDER BY subtotal DESC
+    `;
+
+    let result = [];
+    try {
+      result = await query(itemQuery, { userId, startDate: startVal, endDate: endVal });
+    } catch (err) {
+      console.error('[Dashboard] Detailed Order Items query failed:', err.message || err);
+    }
+
+    return res.json({ success: true, items: result || [] });
+  } catch (err) {
+    console.error('Error fetching detailed order items:', err);
+    res.status(500).json({ success: false, message: 'Internal server error.' });
+  }
+};
+
+export const getCustomerDetailedItemsByCategory = async (req, res) => {
+  try {
+    const userId = req.userId || req.user?.id || req.user?.user_id;
+    if (!userId) return res.status(401).json({ success: false, message: "Unauthorized." });
+
+    const { category, startDate, endDate } = req.query;
+    if (!category) return res.status(400).json({ success: false, message: "Category name is required." });
+
+    let startVal = startDate ? new Date(startDate) : null;
+    let endVal = endDate ? new Date(endDate) : null;
+    if (startVal && isNaN(startVal.getTime())) startVal = null;
+    if (endVal && isNaN(endVal.getTime())) endVal = null;
+
+    let orderDateFilter = "";
+    let resDateFilter = "";
+    if (startVal && endVal) {
+      orderDateFilter = " AND o.created_at >= @startDate AND o.created_at <= @endDate ";
+      resDateFilter = " AND r.created_at >= @startDate AND r.created_at <= @endDate ";
+    }
+
+    const itemQuery = `
+      SELECT 
+        d.dish_name,
+        d.dish_id,
+        mc.category_name,
+        oi.quantity,
+        oi.unit_price,
+        oi.line_total as subtotal,
+        o.created_at
+      FROM dbo.OrderItems oi
+      JOIN dbo.Orders o ON oi.order_id = o.order_id
+      JOIN dbo.Dishes d ON oi.dish_id = d.dish_id
+      JOIN dbo.MenuCategories mc ON d.category_id = mc.category_id
+      WHERE o.customer_id = @userId 
+        AND mc.category_name = @category
+        AND oi.item_status != N'Cancelled'
+        ${orderDateFilter}
+      
+      UNION ALL
+      
+      SELECT 
+        d.dish_name,
+        d.dish_id,
+        mc.category_name,
+        pi.quantity,
+        pi.unit_price,
+        (pi.quantity * pi.unit_price) as subtotal,
+        r.created_at
+      FROM dbo.PreorderItems pi
+      JOIN dbo.Reservations r ON pi.reservation_id = r.reservation_id
+      JOIN dbo.Dishes d ON pi.dish_id = d.dish_id
+      JOIN dbo.MenuCategories mc ON d.category_id = mc.category_id
+      WHERE r.customer_id = @userId 
+        AND mc.category_name = @category
+        AND r.reservation_status IN (N'Await Check-in', N'Dining', N'Completed')
+        ${resDateFilter}
+      ORDER BY created_at DESC
+    `;
+
+    let result = [];
+    try {
+      result = await query(itemQuery, { userId, category, startDate: startVal, endDate: endVal });
+    } catch (err) {
+      console.error('[Dashboard] Detailed Category Items query failed:', err.message || err);
+    }
+
+    return res.json({ success: true, items: result || [] });
+  } catch (err) {
+    console.error('Error fetching detailed category items:', err);
+    res.status(500).json({ success: false, message: 'Internal server error.' });
+  }
+};
+
+export const getCustomerRecentActivity = async (req, res) => {
+  try {
+    const userId = req.userId || req.user?.id || req.user?.user_id;
+    if (!userId) return res.status(401).json({ success: false, message: "Unauthorized." });
+
+    const { startDate, endDate } = req.query;
+    const limitParam = parseInt(req.query.limit, 10);
+    const limit = (!isNaN(limitParam) && limitParam > 0) ? Math.min(limitParam, 100) : 10;
+
+    let startVal = startDate ? new Date(startDate) : null;
+    let endVal = endDate ? new Date(endDate) : null;
+    if (startVal && isNaN(startVal.getTime())) startVal = null;
+    if (endVal && isNaN(endVal.getTime())) endVal = null;
+
+    let orderDateFilter = "";
+    let resDatFilter = "";
+    if (startVal && endVal) {
+      orderDateFilter = " AND o.created_at >= @startDate AND o.created_at <= @endDate ";
+      resDatFilter = " AND r.created_at >= @startDate AND r.created_at <= @endDate ";
+    }
+
+    const actQuery = `
+            SELECT TOP (${limit}) * FROM (
+                SELECT 
+                    'order' AS type,
+                    o.order_id AS id,
+                    o.order_status AS status,
+                    o.total_amount AS amount,
+                    o.created_at,
+                    (SELECT COUNT(*) FROM dbo.OrderItems oi WHERE oi.order_id = o.order_id AND oi.item_status != N'Cancelled') AS item_count,
+                    t.table_number,
+                    NULL AS source
+                FROM dbo.Orders o
+                LEFT JOIN dbo.RestaurantTables t ON o.table_id = t.table_id
+                WHERE o.customer_id = @userId ${orderDateFilter}
+                
+                UNION ALL
+                
+                SELECT 
+                    'reservation' AS type,
+                    r.reservation_id AS id,
+                    r.reservation_status AS status,
+                    ISNULL(
+                      (SELECT SUM(p.amount_paid) FROM dbo.Payments p 
+                       WHERE p.reservation_id = r.reservation_id AND p.payment_status = N'Completed'),
+                      0
+                    ) AS amount,
+                    r.created_at,
+                    (SELECT COUNT(*) FROM dbo.PreorderItems pi WHERE pi.reservation_id = r.reservation_id) AS item_count,
+                    (SELECT TOP 1 tbl.table_number FROM dbo.ReservationTables rt 
+                     JOIN dbo.RestaurantTables tbl ON rt.table_id = tbl.table_id 
+                     WHERE rt.reservation_id = r.reservation_id) AS table_number,
+                    r.reservation_source AS source
+                FROM dbo.Reservations r
+                WHERE r.customer_id = @userId ${resDatFilter}
+                    AND r.reservation_status IN (N'Await Check-in', N'Dining', N'Completed')
+            ) AS Combined
+            ORDER BY created_at DESC
+        `;
+
+    let result = [];
+    try {
+      result = await query(actQuery, { userId, startDate: startVal, endDate: endVal });
+    } catch (err) {
+      console.error('[RecentActivity] Query error:', err.message);
+    }
+    return res.json({ success: true, activity: result || [] });
+  } catch (err) {
+    console.error('Error fetching recent activity:', err);
+    res.status(500).json({ success: false, message: 'Internal server error.' });
+  }
+};
+
+/**
+ * GET /api/customer/dashboard/activity-items?type=order|reservation&id=123
+ * Returns dish-level items for a specific order or reservation (preorder items).
+ * Per-account isolation: verifies customer_id ownership before returning data.
+ */
+export const getActivityOrderItems = async (req, res) => {
+  try {
+    const userId = req.userId || req.user?.id || req.user?.user_id;
+    if (!userId) return res.status(401).json({ success: false, message: 'Unauthorized.' });
+
+    const { type, id } = req.query;
+    if (!type || !id) return res.status(400).json({ success: false, message: 'type and id query params are required.' });
+
+    const parsedId = parseInt(id, 10);
+    if (isNaN(parsedId) || parsedId <= 0) return res.status(400).json({ success: false, message: 'id must be a positive integer.' });
+
+    let items = [];
+    let meta = {};
+
+    if (type === 'order') {
+      // Verify ownership
+      const ownerRows = await query(
+        `SELECT o.order_id, o.total_amount, o.order_status, o.order_type, t.table_number
+         FROM dbo.Orders o
+         LEFT JOIN dbo.RestaurantTables t ON o.table_id = t.table_id
+         WHERE o.order_id = @id AND o.customer_id = @userId`,
+        { id: parsedId, userId }
+      );
+      if (ownerRows.length === 0) return res.status(404).json({ success: false, message: 'Order not found.' });
+      const ord = ownerRows[0];
+      meta = {
+        total_amount: ord.total_amount,
+        order_status: ord.order_status,
+        order_type: ord.order_type,
+        table_number: ord.table_number
+      };
+
+      items = await query(
+        `SELECT 
+           oi.order_item_id, oi.quantity, oi.unit_price,
+           oi.line_total AS subtotal, oi.notes,
+           d.dish_name,
+           mc.category_name,
+           CONCAT('/api/dishes/', d.dish_id, '/image') AS image_url
+         FROM dbo.OrderItems oi
+         JOIN dbo.Dishes d ON oi.dish_id = d.dish_id
+         LEFT JOIN dbo.MenuCategories mc ON d.category_id = mc.category_id
+         WHERE oi.order_id = @id AND oi.item_status != N'Cancelled'
+         ORDER BY oi.order_item_id ASC`,
+        { id: parsedId }
+      );
+
+    } else if (type === 'reservation') {
+      // Verify ownership
+      const ownerRows = await query(
+        `SELECT r.reservation_id, r.reservation_status, r.reservation_start_at, r.guest_count,
+                r.deposit_amount, r.final_total,
+                (SELECT TOP 1 tbl.table_number FROM dbo.ReservationTables rt 
+                 JOIN dbo.RestaurantTables tbl ON rt.table_id = tbl.table_id 
+                 WHERE rt.reservation_id = r.reservation_id) AS table_number,
+                ISNULL(
+                  (SELECT SUM(p.amount_paid) FROM dbo.Payments p 
+                   WHERE p.reservation_id = r.reservation_id AND p.payment_status = N'Completed'),
+                  0
+                ) AS total_paid
+         FROM dbo.Reservations r
+         WHERE r.reservation_id = @id AND r.customer_id = @userId`,
+        { id: parsedId, userId }
+      );
+      if (ownerRows.length === 0) return res.status(404).json({ success: false, message: 'Reservation not found.' });
+      const rsv = ownerRows[0];
+      meta = {
+        reservation_status: rsv.reservation_status,
+        reservation_start_at: rsv.reservation_start_at,
+        guest_count: rsv.guest_count,
+        deposit_amount: rsv.deposit_amount,
+        final_total: rsv.final_total,
+        total_paid: rsv.total_paid,
+        table_number: rsv.table_number
+      };
+
+      items = await query(
+        `SELECT 
+           pi.preorder_item_id AS order_item_id,
+           pi.quantity, pi.unit_price,
+           (pi.quantity * pi.unit_price) AS subtotal,
+           pi.notes,
+           d.dish_name,
+           mc.category_name,
+           CONCAT('/api/dishes/', d.dish_id, '/image') AS image_url
+         FROM dbo.PreorderItems pi
+         JOIN dbo.Dishes d ON pi.dish_id = d.dish_id
+         LEFT JOIN dbo.MenuCategories mc ON d.category_id = mc.category_id
+         WHERE pi.reservation_id = @id
+         ORDER BY pi.preorder_item_id ASC`,
+        { id: parsedId }
+      );
+    } else {
+      return res.status(400).json({ success: false, message: 'type must be "order" or "reservation".' });
+    }
+
+    return res.json({ success: true, items, meta });
+  } catch (err) {
+    console.error('Error fetching activity items:', err);
+    res.status(500).json({ success: false, message: 'Internal server error.' });
+  }
+};
